@@ -1,7 +1,7 @@
 app [makeGlue] { pf: platform "../platform/main.roc" }
 
 import pf.Types exposing [Types]
-import pf.Shape exposing [Shape, RocFn]
+import pf.Shape exposing [RocStructFields, RocFn]
 import pf.File exposing [File]
 import pf.TypeId exposing [TypeId]
 import "../static/Cargo.toml" as rocAppCargoToml : Str
@@ -40,6 +40,7 @@ modFileContent = \typesByArch ->
             #[cfg(target_arch = "$(archStr)")]
             pub use $(archStr)::*;
 
+
             """
 
 fileHeader =
@@ -62,7 +63,6 @@ fileHeader =
     #![allow(clippy::clone_on_copy)]
     #![allow(clippy::non_canonical_partial_ord_impl)]
 
-
     use roc_std::RocRefcounted;
     use roc_std::roc_refcounted_noop_impl;
 
@@ -84,11 +84,10 @@ staticFiles = [
 generateArchFile : Types -> File
 generateArchFile = \types ->
     content =
-        types
-        |> typesToTlds
-        |> Set.map generateTld
-        |> Set.toList
+        List.concat (typesToTlds types) (entrypoints types)
+        |> List.map generateTld
         |> Str.joinWith "\n\n"
+        |> Str.withPrefix fileHeader
 
     archStr =
         types
@@ -113,6 +112,17 @@ Symbol : Str
 RustType : Str
 
 StructFields : List { name : Symbol, type : RustType }
+Trait : [
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Debug,
+]
 
 Tld : [
     EntryPoint
@@ -125,28 +135,153 @@ Tld : [
         {
             name : Symbol,
             fields : StructFields,
+            derives : Set Trait,
         },
     RefcountImpl
         {
             name : Symbol,
             kind : [
-                Struct
-                    {
-                        fields : List Symbol,
-                    },
+                Noop,
+                Struct { fields : List Symbol },
             ],
         },
 ]
 
-typesToTlds : Types -> Set Tld
-typesToTlds = \types ->
-    Types.walkShapes types (Set.empty {}) \tlds, shape, _typeId ->
-        Set.union tlds (shapeToTlds types shape)
+entrypoints : Types -> List Tld
+entrypoints = \types ->
+    types
+    |> Types.entryPoints
+    |> List.map \T name type ->
+        (args, result) =
+            when Types.shape types type is
+                Function { args: args2, ret } ->
+                    (
+                        List.map args2 \arg -> rustTypeName types arg,
+                        rustTypeName types ret,
+                    )
 
-shapeToTlds : Types, Shape -> Set Tld
-shapeToTlds = \types, shape ->
+                _ -> ([], rustTypeName types type)
+
+        EntryPoint { name, args, result }
+
+supportedTraits : Types, TypeId -> Set Trait
+supportedTraits = \types, type ->
+    traitsHelper = \id -> supportedTraits types id
+
+    fieldsHelper = \fields, allowed ->
+        fields
+        |> List.map \{ id } -> traitsHelper id
+        |> List.walk allowed Set.intersection
+
+    tagsHelper = \tags, allowed ->
+        tags
+        |> List.keepOks \{ payload } ->
+            when payload is
+                Some id -> Ok (traitsHelper id)
+                None -> Err NoPayload
+        |> List.walk allowed Set.intersection
+
+    when Types.shape types type is
+        Num F32 | Num F64 ->
+            Set.fromList [Clone, Copy, Default, PartialEq, PartialOrd, Debug]
+
+        Num _ | Bool | Unit | TagUnion (Enumeration _) ->
+            Set.fromList [Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Debug]
+
+        RocStr ->
+            Set.fromList [Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Debug]
+
+        RocList a ->
+            Set.fromList [Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug]
+            |> Set.intersection (traitsHelper a)
+            |> Set.insert Default # Default returns `[]`, so `a` need not implement Default
+
+        RocResult ok err ->
+            Set.fromList [Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug]
+            |> Set.intersection (traitsHelper ok)
+            |> Set.intersection (traitsHelper err)
+
+        RocBox a ->
+            Set.fromList [PartialEq, Eq, PartialOrd, Ord, Hash, Debug]
+            |> Set.intersection (traitsHelper a)
+            |> Set.insert Clone # Clone clones the pointer, not the value
+            |> Set.insert Hash # Hash hashes the pointer, not the value
+
+        RocDict _ _ ->
+            crash "Dict is not yet implemented in roc_std"
+
+        RocSet _ ->
+            crash "Set is not yet implemented in roc_std"
+
+        Unsized ->
+            # TODO: is this correct?
+            # thusfar I've only seen `Unsized` be used as the type
+            # referenced as the lambdaset in a `Function`
+            # and the derivable traits of a `Function` don't depend on this
+            # so this should be empty I think?
+            Set.empty {}
+
+        EmptyTagUnion ->
+            crash "this should probably be made to never happen"
+
+        Function _
+        | Struct { fields: HasClosure _ }
+        | TagUnionPayload { fields: HasClosure _ }
+        | TagUnion (SingleTagStruct { payload: HasClosure _ }) ->
+            Set.single Debug
+
+        Struct { fields: HasNoClosure fields } ->
+            allowed = Set.fromList [Clone, Copy, Default, PartialOrd, Ord, PartialEq, Eq, Hash, Debug]
+            fieldsHelper fields allowed
+
+        TagUnionPayload { fields: HasNoClosure fields } ->
+            allowed = Set.fromList [Clone, Copy, Default, PartialEq, Eq, Hash, Debug]
+            fieldsHelper fields allowed
+
+        TagUnion (SingleTagStruct { payload: HasNoClosure fields }) ->
+            allowed = Set.fromList [Clone, Copy, Default, PartialEq, Eq, Hash, Debug]
+            fieldsHelper fields allowed
+
+        TagUnion (NonRecursive { tags }) ->
+            allowed = Set.fromList [Clone, Copy, PartialEq, Eq, Hash, Debug]
+            tagsHelper tags allowed
+
+        # the `{ tags: tags } situation is due to https://github.com/roc-lang/roc/issues/7167
+        TagUnion (Recursive { tags: tags })
+        | TagUnion (NullableWrapped { tags: tags }) ->
+            allowed = Set.fromList [Clone, PartialEq, Eq, Hash, Debug]
+            tagsHelper tags allowed
+
+        TagUnion (NonNullableUnwrapped { payload })
+        | TagUnion (NullableUnwrapped { nonNullPayload: payload }) ->
+            Set.fromList [Clone, PartialEq, Eq, Hash, Debug]
+            |> Set.intersection (traitsHelper payload)
+
+        RecursivePointer _ ->
+            # TODO: is this correct?
+            # encountering a RecursivePointer means we should have already
+            # encountered the thing it's pointing to
+            # so it wouldn't disqualify it from anything a recursive tag union
+            # isn't already disqualified from
+            Set.fromList [Clone, PartialEq, Eq, Hash, Debug]
+
+typesToTlds : Types -> List Tld
+typesToTlds = \types ->
+    types
+    |> Types.mapShapes \_, type -> typeToTlds types type
+    |> List.join
+
+typeToTlds : Types, TypeId -> List Tld
+typeToTlds = \types, type ->
+    shape = Types.shape types type
     when shape is
-        Struct { name, fields } -> structTlds types name fields
+        Struct { fields } ->
+            name = rustTypeName types type
+            traits = supportedTraits types type
+            structTlds types name fields traits
+
+        # Function rocFn ->
+        #     functionTlds types rocFn
         Unit
         | Unsized
         | EmptyTagUnion
@@ -160,39 +295,145 @@ shapeToTlds = \types, shape ->
         | RocBox _ ->
             # these are taken care of by the Roc std library
             # or represented as Rust builtins
-            Set.empty {}
+            []
 
-        _ -> crash "todo"
+        _ -> crash "todo: $(Inspect.toStr shape)"
 
-structTlds : Types, Str, Shape.RocStructFields -> Set Tld
-structTlds = \types, recordName, fields ->
-    getFields = \list -> List.map list \{ name, id } -> { name, type: id }
-
-    # this might be a problem, but the previous RustGlue doesn't do anything with this either
-    justFields =
-        when fields is
-            HasNoClosure list -> getFields list
-            HasClosure list -> getFields list
+structTlds : Types, RustType, RocStructFields, Set Trait -> List Tld
+structTlds = \types, recordName, fieldData, structTraits ->
+    getFields = \fields ->
+        List.map fields \{ name, id } ->
+            { name, type: rustTypeName types id }
 
     rustRecordFields =
-        justFields
-        |> List.map \{ name, type } -> { name, type: rustTypeName types type }
+        when fieldData is
+            HasNoClosure fieldList -> getFields fieldList
+            HasClosure fieldList -> getFields fieldList
 
+    structDef : Tld
     structDef =
         RecordStructDef {
             name: recordName,
             fields: rustRecordFields,
+            derives: structTraits,
         }
 
+    refcountImplKind =
+        if Set.contains structTraits Copy then
+            Noop
+        else
+            fieldNames = rustRecordFields |> List.map .name
+            Struct { fields: fieldNames }
+
+    refcountImpl : Tld
     refcountImpl = RefcountImpl {
         name: recordName,
-        # kind: Struct { fields },
-        kind: Struct { fields: [] },
+        kind: refcountImplKind,
     }
 
-    Set.fromList [structDef, refcountImpl]
+    [structDef, refcountImpl]
+
+# functionTlds : Types, RocFn -> List Tld
+# functionTlds = \types, fnData ->
+
+reservedKeywords = Set.fromList [
+    "try",
+    "abstract",
+    "become",
+    "box",
+    "do",
+    "final",
+    "macro",
+    "override",
+    "priv",
+    "typeof",
+    "unsized",
+    "virtual",
+    "yield",
+    "async",
+    "await",
+    "dyn",
+    "as",
+    "break",
+    "const",
+    "continue",
+    "crate",
+    "else",
+    "enum",
+    "extern",
+    "false",
+    "fn",
+    "for",
+    "if",
+    "impl",
+    "in",
+    "let",
+    "loop",
+    "match",
+    "mod",
+    "move",
+    "mut",
+    "pub",
+    "ref",
+    "return",
+    "self",
+    "Self",
+    "static",
+    "struct",
+    "super",
+    "trait",
+    "true",
+    "type",
+    "unsafe",
+    "use",
+    "where",
+    "while",
+]
+
+escape : Str -> RustType
+escape = \identifier ->
+    if Set.contains reservedKeywords identifier then
+        "r#$(identifier)"
+    else
+        identifier
 
 rustTypeName : Types, TypeId -> RustType
+rustTypeName = \types, type ->
+    helper = \id -> rustTypeName types id
+
+    when Types.shape types type is
+        RocStr -> "roc_std::RocStr"
+        Bool -> "bool"
+        Num U8 -> "u8"
+        Num I8 -> "i8"
+        Num U16 -> "u16"
+        Num I16 -> "i16"
+        Num U32 -> "u32"
+        Num I32 -> "i32"
+        Num U64 -> "u64"
+        Num I64 -> "i64"
+        Num U128 -> "u128"
+        Num I128 -> "i128"
+        Num F32 -> "f32"
+        Num F64 -> "f64"
+        Num Dec -> "roc_std::RocDec"
+        RocResult a b -> "roc_std::RocResult<$(helper a), $(helper b)>"
+        RocList a -> "roc_std::RocList<$(helper a)>"
+        RocBox a -> "roc_std::RocBox<$(helper a)>"
+        TagUnion (Enumeration { name }) -> escape name
+        TagUnion (NonRecursive { name }) -> escape name
+        TagUnion (Recursive { name }) -> escape name
+        TagUnion (NullableWrapped { name }) -> escape name
+        TagUnion (NonNullableUnwrapped { name }) -> escape name
+        TagUnion (SingleTagStruct { name }) -> escape name
+        TagUnion (NullableUnwrapped { name }) -> escape name
+        EmptyTagUnion -> crash "should never happen"
+        Struct { name } -> escape name
+        Function { functionName } -> escape functionName
+        TagUnionPayload { name } -> escape name
+        Unit -> "()"
+        RecursivePointer _ | Unsized -> crash "what"
+        RocDict _ _ | RocSet _ -> crash "todo"
 
 # indents all lines except the first so multiline substitions play nice in string interpolation
 # e.g:
@@ -207,6 +448,23 @@ indentedBy = \code, amount ->
 
     Str.replaceEach code "\n" "\n$(indent)"
 
+derivesList : Set Trait -> Str
+derivesList = \traits ->
+    traits
+    |> Set.toList
+    |> List.map \trait ->
+        when trait is
+            Clone -> "Clone"
+            Copy -> "Copy"
+            Default -> "Default"
+            PartialEq -> "PartialEq"
+            Eq -> "Eq"
+            PartialOrd -> "PartialOrd"
+            Ord -> "Ord"
+            Hash -> "Hash"
+            Debug -> "Debug"
+    |> Str.joinWith ", "
+
 generateTld : Tld -> Str
 generateTld = \tld ->
     when tld is
@@ -216,12 +474,15 @@ generateTld = \tld ->
                 |> List.mapWithIndex \type, n -> "arg$(Num.toStr n): $(type)"
                 |> Str.joinWith ", "
 
-            callArgs = Str.joinWith args ", "
+            callArgs =
+                args
+                |> List.mapWithIndex \_, n -> "arg$(Num.toStr n)"
+                |> Str.joinWith ", "
 
             """
             pub fn $(name)($(argList)) -> $(result) {
                 extern "C" {
-                    fn roc__forHost_1_exposed_generic(ret: *mut $(result), $(argList));
+                    fn roc__$(name)_1_exposed_generic(ret: *mut $(result), $(argList));
                 }
 
                 let mut ret = core::mem::MaybeUninit::uninit();
@@ -234,41 +495,41 @@ generateTld = \tld ->
             }
             """
 
-        RecordStructDef { name, fields: fieldNames } ->
+        RecordStructDef { name, fields: fieldNames, derives } ->
             fields =
                 fieldNames
-                |> List.map \{ name: fieldName, type } -> "$(fieldName): $(type)"
+                |> List.map \{ name: fieldName, type } -> "pub $(fieldName): $(type),"
                 |> Str.joinWith "\n"
-
-            # TODO
-            derives = "#[derive()]"
 
             """
             #[repr(C)]
-            $(derives)
+            #[derive($(derivesList derives))]
             pub struct $(name) {
                 $(fields |> indentedBy 1)
             }
             """
 
+        RefcountImpl { name, kind: Noop } ->
+            "roc_refcounted_noop_impl!($(name));"
+
         RefcountImpl { name, kind: Struct { fields } } ->
             incs =
                 fields
-                |> List.map \field -> "$(field).inc();"
+                |> List.map \field -> "self.$(field).inc();"
                 |> Str.joinWith "\n"
 
             decs =
                 fields
-                |> List.map \field -> "$(field).dec();"
+                |> List.map \field -> "self.$(field).dec();"
                 |> Str.joinWith "\n"
 
             """
             impl roc_std::RocRefcounted for $(name) {
-                fn inc() {
+                fn inc(&mut self) {
                     $(incs |> indentedBy 2)
                 }
 
-                fn dec() {
+                fn dec(&mut self) {
                     $(decs |> indentedBy 2)
                 }
 
