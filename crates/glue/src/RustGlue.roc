@@ -1,7 +1,7 @@
 app [makeGlue] { pf: platform "../platform/main.roc" }
 
 import pf.Types exposing [Types]
-import pf.Shape exposing [RocStructFields, RocFn]
+import pf.Shape exposing [RocStructFields]
 import pf.File exposing [File]
 import pf.TypeId exposing [TypeId]
 import "../static/Cargo.toml" as rocAppCargoToml : Str
@@ -56,9 +56,7 @@ fileHeader =
     #![allow(clippy::undocumented_unsafe_blocks)]
     #![allow(clippy::redundant_static_lifetimes)]
     #![allow(clippy::unused_unit)]
-    #![allow(clippy::missing_safety_doc)]
     #![allow(clippy::let_and_return)]
-    #![allow(clippy::missing_safety_doc)]
     #![allow(clippy::needless_borrow)]
     #![allow(clippy::clone_on_copy)]
     #![allow(clippy::non_canonical_partial_ord_impl)]
@@ -108,62 +106,6 @@ archName = \arch ->
         X86x32 -> "x86"
         X86x64 -> "x86_64"
 
-Symbol : Str
-RustType : Str
-
-StructFields : List { name : Symbol, type : RustType }
-Trait : [
-    Clone,
-    Copy,
-    Default,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Hash,
-    Debug,
-]
-
-Tld : [
-    EntryPoint
-        {
-            name : Symbol,
-            args : List RustType,
-            result : RustType,
-        },
-    RecordStructDef
-        {
-            name : Symbol,
-            fields : StructFields,
-            derives : Set Trait,
-        },
-    RefcountImpl
-        {
-            name : Symbol,
-            kind : [
-                Noop,
-                Struct { fields : List Symbol },
-            ],
-        },
-]
-
-entrypoints : Types -> List Tld
-entrypoints = \types ->
-    types
-    |> Types.entryPoints
-    |> List.map \T name type ->
-        (args, result) =
-            when Types.shape types type is
-                Function { args: args2, ret } ->
-                    (
-                        List.map args2 \arg -> rustTypeName types arg,
-                        rustTypeName types ret,
-                    )
-
-                _ -> ([], rustTypeName types type)
-
-        EntryPoint { name, args, result }
-
 supportedTraits : Types, TypeId -> Set Trait
 supportedTraits = \types, type ->
     traitsHelper = \id -> supportedTraits types id
@@ -185,8 +127,11 @@ supportedTraits = \types, type ->
         Num F32 | Num F64 ->
             Set.fromList [Clone, Copy, Default, PartialEq, PartialOrd, Debug]
 
-        Num _ | Bool | Unit | TagUnion (Enumeration _) ->
+        Num _ | Bool | Unit ->
             Set.fromList [Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Debug]
+
+        TagUnion (Enumeration _) ->
+            Set.fromList [Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug]
 
         RocStr ->
             Set.fromList [Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Debug]
@@ -265,6 +210,113 @@ supportedTraits = \types, type ->
             # isn't already disqualified from
             Set.fromList [Clone, PartialEq, Eq, Hash, Debug]
 
+Symbol : Str
+RustType : Str
+
+StructFields : List { name : Symbol, type : RustType }
+TagUnionVariants : List { tag : Symbol, payload : RustType }
+
+Trait : [
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Debug,
+]
+
+Tld : [
+    EntryPoint
+        {
+            name : Symbol,
+            args : List RustType,
+            result : RustType,
+        },
+    RecordStructDef
+        {
+            name : Symbol,
+            fields : StructFields,
+            derives : Set Trait,
+        },
+    RefcountImpl
+        {
+            name : Symbol,
+            kind : [
+                Noop,
+                Struct { fields : List Symbol },
+            ],
+        },
+    EnumerationEnumDef
+        {
+            name : Symbol,
+            tags : List Symbol,
+            repr : RustType,
+            derives : Set Trait,
+        },
+    EnumerationDebugImpl
+        {
+            name : Symbol,
+            tags : List Symbol,
+        },
+    PayloadUnionDef
+        {
+            name : Symbol,
+            variants : TagUnionVariants,
+        },
+    NonRecTagUnionDef
+        {
+            name : Symbol,
+            payload : RustType,
+            discriminant : RustType,
+            discriminantOffset : U32,
+            derives : Set Trait,
+        },
+    RustNonRecTagUnionDef
+        {
+            name : Symbol,
+            variants : TagUnionVariants,
+            payload : RustType,
+            discriminant : RustType,
+            derives : Set Trait,
+        },
+    NonRecTagUnionConversionImpls
+        {
+            rocType : RustType,
+            rustType : RustType,
+            discriminant : RustType,
+            union : RustType,
+        },
+    NonRecTagUnionDebugImpl
+        {
+            name : Symbol,
+            variants : TagUnionVariants
+        },
+    NonRecTagUnionDebugImpl
+        {
+
+        }
+]
+
+entrypoints : Types -> List Tld
+entrypoints = \types ->
+    types
+    |> Types.entryPoints
+    |> List.map \T name type ->
+        (args, result) =
+            when Types.shape types type is
+                Function { args: args2, ret } ->
+                    (
+                        List.map args2 \arg -> rustTypeName types arg,
+                        rustTypeName types ret,
+                    )
+
+                _ -> ([], rustTypeName types type)
+
+        EntryPoint { name, args, result }
+
 typesToTlds : Types -> List Tld
 typesToTlds = \types ->
     types
@@ -276,12 +328,18 @@ typeToTlds = \types, type ->
     shape = Types.shape types type
     when shape is
         Struct { fields } ->
-            name = rustTypeName types type
-            traits = supportedTraits types type
-            structTlds types name fields traits
+            structTlds types type fields
 
-        # Function rocFn ->
-        #     functionTlds types rocFn
+        TagUnion (Enumeration { name, tags, size }) ->
+            enumerationTlds types type (escape name) tags size
+
+        TagUnion (NonRecursive { name, tags, discriminantSize, discriminantOffset }) ->
+            nonRecTlds types type (escape name) tags discriminantSize discriminantOffset
+
+        Function { isToplevel } if isToplevel ->
+            # taken care of by `entrypoints`
+            []
+
         Unit
         | Unsized
         | EmptyTagUnion
@@ -299,8 +357,12 @@ typeToTlds = \types, type ->
 
         _ -> crash "todo: $(Inspect.toStr shape)"
 
-structTlds : Types, RustType, RocStructFields, Set Trait -> List Tld
-structTlds = \types, recordName, fieldData, structTraits ->
+structTlds : Types, TypeId, RocStructFields -> List Tld
+structTlds = \types, type, fieldData ->
+    recordName = rustTypeName types type
+
+    traits = supportedTraits types type
+
     getFields = \fields ->
         List.map fields \{ name, id } ->
             { name, type: rustTypeName types id }
@@ -315,26 +377,136 @@ structTlds = \types, recordName, fieldData, structTraits ->
         RecordStructDef {
             name: recordName,
             fields: rustRecordFields,
-            derives: structTraits,
+            derives: traits,
         }
 
     refcountImplKind =
-        if Set.contains structTraits Copy then
+        if Set.contains traits Copy then
             Noop
         else
             fieldNames = rustRecordFields |> List.map .name
             Struct { fields: fieldNames }
 
     refcountImpl : Tld
-    refcountImpl = RefcountImpl {
-        name: recordName,
-        kind: refcountImplKind,
-    }
+    refcountImpl =
+        RefcountImpl {
+            name: recordName,
+            kind: refcountImplKind,
+        }
 
     [structDef, refcountImpl]
 
-# functionTlds : Types, RocFn -> List Tld
-# functionTlds = \types, fnData ->
+discriminantRepr : U32 -> RustType
+discriminantRepr = \bytes ->
+    when bytes is
+        0 -> crash "this is definitely a bug!"
+        1 -> "u8"
+        2 -> "u16"
+        3 | 4 -> "u32"
+        5 | 6 | 7 | 8 -> "u64"
+        _ -> crash "this is probably a bug!"
+
+enumerationTlds : Types, TypeId, RustType, List Str, U32 -> List Tld
+enumerationTlds = \types, type, name, tags, reprBytes ->
+    derives =
+        supportedTraits types type
+        |> Set.remove Debug # since we implement this manually
+
+    repr = discriminantRepr reprBytes
+
+    [
+        EnumerationEnumDef { name, tags, repr, derives },
+        EnumerationDebugImpl { name, tags },
+        RefcountImpl { name, kind: Noop },
+    ]
+
+nonRecTlds : Types, TypeId, Str, List { name : Str, payload : [Some TypeId, None] }, U32, U32 -> List Tld
+nonRecTlds = \types, type, rocName, variants, discriminantSize, discriminantOffset ->
+    discriminantName = "discriminant_$(rocName)"
+    unionName = "union_$(rocName)"
+    enumName = "enum_$(rocName)"
+
+    tagUnionName = escape rocName
+
+    tags = List.map variants .name
+
+    rustUnionVariants =
+        List.map variants \{ name, payload } ->
+            payloadType =
+                when payload is
+                    Some id -> rustTypeName types id
+                    None -> "()"
+
+            { tag: name, payload: payloadType }
+    
+    unionVariants =
+        List.map variants \{ name, payload } ->
+            payloadType =
+                when payload is
+                    Some id ->
+                        payloadStr = rustTypeName types id
+                        if
+                            supportedTraits types id
+                            |> Set.contains Copy
+                        then
+                            "core::mem::ManuallyDrop<$(payloadStr)>"
+                        else
+                            payloadStr
+                        
+                    None -> "()"
+
+            { tag: name, payload: payloadType }
+    
+    # nonCopyVariants =
+
+
+    allowedTraits = supportedTraits types type
+
+    tagUnionDerives =
+        # removing the ones we manually implement (if they're supported at all)
+        allowedTraits
+        |> Set.remove PartialEq # TODO: implement manually
+        |> Set.remove Eq # TODO: implement manually
+        |> Set.remove Hash # TODO: implement manually
+        |> Set.remove Debug
+
+    enumerationTlds types type discriminantName tags discriminantSize
+    |> List.concat [
+        PayloadUnionDef {
+            name: unionName,
+            variants: unionVariants,
+        },
+        NonRecTagUnionDef {
+            name: tagUnionName,
+            payload: unionName,
+            discriminant: discriminantName,
+            discriminantOffset,
+            derives: tagUnionDerives,
+        },
+        RustNonRecTagUnionDef {
+            name: enumName,
+            payload: unionName,
+            variants: rustEnumVariants,
+            discriminant: discriminantName,
+            derives: allowedTraits,
+        },
+        NonRecTagUnionConversionImpls {
+            rocType: tagUnionName,
+            rustType: enumName,
+            discriminant: discriminantName,
+            union: unionName,
+        },
+        NonRecTagUnionDebugImpl {
+            
+        }
+    ]
+    |> List.appendIfOk (
+        if Set.contains allowedTraits Hash then
+            
+            |> Ok
+        else
+            Err NotEligable
+    )
 
 reservedKeywords = Set.fromList [
     "try",
@@ -534,5 +706,150 @@ generateTld = \tld ->
                 }
 
                 fn is_refcounted() -> bool { true }
+            }
+            """
+
+        EnumerationEnumDef { name, tags: tagNames, repr, derives } ->
+            tags =
+                tagNames
+                |> List.mapWithIndex \tag, i -> "$(tag) = $(Num.toStr i),"
+                |> Str.joinWith "\n"
+
+            """
+            #[repr($(repr))]
+            #[derive($(derivesList derives))]
+            pub enum $(name) {
+                $(tags |> indentedBy 1)
+            }
+            """
+
+        EnumerationDebugImpl { name, tags } ->
+            matchArms =
+                tags
+                |> List.map \tag ->
+                    "Self::$(tag) => f.write_str(\"$(name)::$(tag)\"),"
+                |> Str.joinWith "\n"
+
+            """
+            impl core::fmt::Debug for $(name) {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    match self {
+                        $(matchArms |> indentedBy 3)
+                    }
+                }
+            }
+            """
+
+        PayloadUnionDef { name, variants } ->
+            variantDecls =
+                variants
+                |> List.map \{ tag, payload } -> "$(tag): $(payload),"
+                |> Str.joinWith "\n"
+
+            """
+            #[repr(C)]
+            pub union $(name) {
+                $(variantDecls |> indentedBy 1)
+            }
+            """
+
+        NonRecTagUnionDef { name, payload, discriminant, discriminantOffset, derives } ->
+            """
+            #[repr(C)]
+            #[derive($(derivesList derives))]
+            pub struct $(name) {
+                payload: $(payload),
+                discriminant: $(discriminant),
+            }
+
+            const DISCRIMINANT_OFFSET_CHECK: () = assert_eq!(core::mem::offset_of!($(name), discriminant), $(Inspect.toStr discriminantOffset));
+            """
+
+        RustNonRecTagUnionDef { name, variants, derives } ->
+            variantDecls =
+                variants
+                |> List.map \{ tag, payload } -> "$(tag)($(payload))," # TODO: have these payloads be RustTypes (`()` in the event there's no payload)
+                |> Str.joinWith "\n"
+
+            """
+            #[repr(C)]
+            #[derive($(derivesList derives))]
+            pub enum $(name) {
+                $(variantDecls |> indentedBy 1)
+            }
+            """
+
+        NonRecTagUnionConversionImpls { rocType, rustType, discriminant, union } ->
+            """
+            impl From<$(rocType)> for $(rustType) {
+                fn from(item: $(rocType)) -> Self {
+                    #[repr(C)]
+                    struct Temp {
+                        discriminant: $(discriminant),
+                        payload: $(union),
+                    }
+
+                    let with_swapped_fields = Temp {
+                        discriminant: item.discriminant,
+                        payload: item.payload,
+                    };
+
+                    // SAFETY: Temp has the same layout as a #[repr(C)] enum, which is what $(rustType) is:
+                    // https://doc.rust-lang.org/reference/type-layout.html#reprc-enums-with-fields
+                    unsafe { core::mem::transmute::<Temp, $(rustType)>(with_swapped_fields) }
+                }
+            }
+
+            impl From<$(rustType)> for $(rocType) {
+                fn from(item: $(rustType)) -> Self {
+                    #[repr(C)]
+                    struct Temp {
+                        discriminant: $(discriminant),
+                        payload: $(union),
+                    }
+
+                    // SAFETY: Temp has the same layout as a #[repr(C)] enum, which is what $(rustType) is:
+                    // https://doc.rust-lang.org/reference/type-layout.html#reprc-enums-with-fields
+                    let decomposed = unsafe { core::mem::transmute::<$(rocType), Temp>(item) };
+
+                    $(rocType) {
+                        payload: decomposed.payload,
+                        discriminant: decomposed.discriminant,
+                    }
+                }
+            }
+            """
+        
+        NonRecTagUnionDebugImpl { name, tags } ->
+            
+            matchArms =
+                tags
+                |> List.map \tag ->
+                    if tag == "()"
+                        """
+                        $(tag) => {
+                            "$(name)::$(tag)"
+                        },
+                        """
+                    else
+                        """
+                        $(tag) => {
+                            f.debug_tuple("$(name)::$(tag)").field(&self.payload.$(tag)).finish()
+                        },
+                        """
+                |> List.joinWith "\n"
+
+            """
+            impl core::fmt::Debug for $(name) {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    use $(name)::*;
+
+                    // SAFETY: discriminant is matched on before accessing union
+                    unsafe {
+                        match self.discriminant {
+                            $(matchArms |> indentedBy 4)
+                        }
+                    }
+                }
             }
             """
