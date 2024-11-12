@@ -166,6 +166,12 @@ mod glue_cli_run {
             Answer was: "Hello World!"
             Answer was: discriminant_U1::None
         "#),
+        u128_i128:"u128-i128" => indoc!(r#"
+            u128 was: 170141183460469231731687303715884105727
+            i128 was: 85070591730234615865843651857942052863
+            u128 was: 340282366920938463463374607431768211454
+            i128 was: 170141183460469231731687303715884105726
+        "#),
     }
 
     fn check_for_tests(all_fixtures: &mut roc_collections::VecSet<String>) {
