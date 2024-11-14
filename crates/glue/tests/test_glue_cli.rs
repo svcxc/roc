@@ -110,6 +110,16 @@ mod glue_cli_run {
             `Bar 123` is: NonRecursive::Bar(123)
             `Baz` is: NonRecursive::Baz(())
             `Blah 456` is: NonRecursive::Blah(456)
+            roc to rusty: NonRecursive::Foo("small str") -> Foo("small str")
+            rusty to roc: Foo("small str") -> NonRecursive::Foo("small str")
+            roc to rusty: NonRecursive::Foo("A long enough string to not be small") -> Foo("A long enough string to not be small")
+            rusty to roc: Foo("A long enough string to not be small") -> NonRecursive::Foo("A long enough string to not be small")
+            roc to rusty: NonRecursive::Bar(123) -> Bar(123)
+            rusty to roc: Bar(123) -> NonRecursive::Bar(123)
+            roc to rusty: NonRecursive::Baz(()) -> Baz
+            rusty to roc: Baz -> NonRecursive::Baz(())
+            roc to rusty: NonRecursive::Blah(456) -> Blah(456)
+            rusty to roc: Blah(456) -> NonRecursive::Blah(456)
         "#),
         union_without_padding:"union-without-padding" => indoc!(r#"
             tag_union was: NonRecursive::Foo("This is a test")
@@ -117,6 +127,16 @@ mod glue_cli_run {
             `Bar 123` is: NonRecursive::Bar(123)
             `Baz` is: NonRecursive::Baz(())
             `Blah 456` is: NonRecursive::Blah(456)
+            roc to rusty: NonRecursive::Foo("small str") -> Foo("small str")
+            rusty to roc: Foo("small str") -> NonRecursive::Foo("small str")
+            roc to rusty: NonRecursive::Foo("A long enough string to not be small") -> Foo("A long enough string to not be small")
+            rusty to roc: Foo("A long enough string to not be small") -> NonRecursive::Foo("A long enough string to not be small")
+            roc to rusty: NonRecursive::Bar(123) -> Bar(123)
+            rusty to roc: Bar(123) -> NonRecursive::Bar(123)
+            roc to rusty: NonRecursive::Baz(()) -> Baz
+            rusty to roc: Baz -> NonRecursive::Baz(())
+            roc to rusty: NonRecursive::Blah(456) -> Blah(456)
+            rusty to roc: Blah(456) -> NonRecursive::Blah(456)
         "#),
         nullable_wrapped:"nullable-wrapped" => indoc!(r#"
             tag_union was: StrFingerTree::More("foo", StrFingerTree::More("bar", StrFingerTree::Empty))
@@ -257,7 +277,12 @@ mod glue_cli_run {
             );
         }
 
-        assert!(glue_out.status.success(), "bad status {glue_out:?}");
+        assert!(
+            glue_out.status.success(),
+            "glue exited with bad status {glue_out:?}\n\n{}\n\n{}",
+            glue_out.stdout,
+            glue_out.status
+        );
 
         glue_out
     }
@@ -280,7 +305,12 @@ mod glue_cli_run {
             );
         }
 
-        assert!(compile_out.status.success(), "bad status {compile_out:?}");
+        assert!(
+            compile_out.status.success(),
+            "app exited with bad status {compile_out:?}\n\n{}\n\n{}",
+            compile_out.stdout,
+            compile_out.status
+        );
 
         compile_out
     }

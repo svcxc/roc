@@ -1,4 +1,6 @@
 use roc_app;
+use roc_app::rusty_NonRecursive;
+use roc_app::NonRecursive;
 use roc_std::RocStr;
 
 extern "C" {
@@ -24,10 +26,10 @@ pub extern "C" fn rust_main() {
     println!(
         "tag_union was: {:?}\n`Foo \"small str\"` is: {:?}\n`Bar 123` is: {:?}\n`Baz` is: {:?}\n`Blah 456` is: {:?}",
         tag_union,
-        roc_app::NonRecursive::Foo("small str".into()),
-        roc_app::NonRecursive::Bar(123),
-        roc_app::NonRecursive::Baz(),
-        roc_app::NonRecursive::Blah(456),
+        NonRecursive::Foo("small str".into()),
+        NonRecursive::Bar(123),
+        NonRecursive::Baz(),
+        NonRecursive::Blah(456),
     ); // Debug
 
     let mut set = HashSet::new();
@@ -36,6 +38,33 @@ pub extern "C" fn rust_main() {
     set.insert(tag_union);
 
     assert_eq!(set.len(), 1);
+
+    let roc_variants = [
+        NonRecursive::Foo("small str".into()),
+        NonRecursive::Foo("A long enough string to not be small".into()),
+        NonRecursive::Bar(123),
+        NonRecursive::Baz(),
+        NonRecursive::Blah(456),
+    ];
+
+    let rusty_variants = [
+        rusty_NonRecursive::Foo("small str".into()),
+        rusty_NonRecursive::Foo("A long enough string to not be small".into()),
+        rusty_NonRecursive::Bar(123),
+        rusty_NonRecursive::Baz,
+        rusty_NonRecursive::Blah(456),
+    ];
+
+    for (roc_variant, rusty_variant) in roc_variants.iter().zip(rusty_variants.iter()) {
+        let into_rusty: rusty_NonRecursive = roc_variant.clone().into();
+        let into_roc: NonRecursive = rusty_variant.clone().into();
+
+        println!("roc to rusty: {roc_variant:?} -> {into_rusty:?}");
+        println!("rusty to roc: {rusty_variant:?} -> {into_roc:?}");
+
+        assert_eq!(rusty_variant, &into_rusty);
+        assert_eq!(roc_variant, &into_roc);
+    }
 }
 
 // Externs required by roc_std and by the Roc app
