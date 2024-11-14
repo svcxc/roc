@@ -752,81 +752,83 @@ generateItemGroup = \itemGroup ->
                 constructors =
                     variants
                     |> List.map \variant ->
-                        constructor =
-                            # TODO: split these into appropriate unsafe "_unchecked" methods and checked and panic-y versions
-                            if variant.payload == "()" then
-                                """
-                                pub fn $(variant.name)() -> Self {
-                                    Self {
-                                        discriminant: $(discriminant.name)::$(variant.name),
-                                        payload: $(union.name) {
-                                            $(variant.name): (),
-                                        }
-                                    }
-                                }
-                                """
-                            else if variant.isCopy then
-                                # TODO: maybe rename the "borrow" methods to "copy_payload" or something more appropriate?
-                                """
-                                pub fn $(variant.name)(payload: $(variant.payload)) -> Self {
-                                    Self {
-                                        discriminant: $(discriminant.name)::$(variant.name),
-                                        payload: $(union.name) {
-                                            $(variant.name): payload,
-                                        }
-                                    }
-                                }
-
-                                pub fn unwrap_$(variant.name)(self) -> $(variant.payload) {
-                                    debug_assert_eq!(self.discriminant, $(discriminant.name)::$(variant.name));
-                                    unsafe { self.payload.$(variant.name) }
-                                }
-
-                                pub fn borrow_$(variant.name)(&mut self) -> $(variant.payload) {
-                                    debug_assert_eq!(self.discriminant, $(discriminant.name)::$(variant.name));
-                                    unsafe { self.payload.$(variant.name) }
-                                }
-                                """
-                            else
-                                """
-                                pub fn $(variant.name)(payload: $(variant.payload)) -> Self {
-                                    Self {
-                                        discriminant: $(discriminant.name)::$(variant.name),
-                                        payload: $(union.name) {
-                                            $(variant.name): core::mem::ManuallyDrop::new(payload),
-                                        }
-                                    }
-                                }
-
-                                pub fn unwrap_$(variant.name)(mut self) -> $(variant.payload) {
-                                    debug_assert_eq!(self.discriminant, $(discriminant.name)::$(variant.name));
-                                    unsafe { core::mem::ManuallyDrop::take(&mut self.payload.$(variant.name)) }
-                                }
-
-                                pub fn borrow_$(variant.name)(&mut self) -> &$(variant.payload) {
-                                    debug_assert_eq!(self.discriminant, $(discriminant.name)::$(variant.name));
-                                    unsafe { &self.payload.$(variant.name) }
-                                }
-                                """
-
-                        variantCheck =
+                        # constructor =
+                        # TODO: split these into appropriate unsafe "_unchecked" methods and checked and panic-y versions
+                        if variant.payload == "()" then
                             """
-                            pub fn is_$(variant.name)(&self) -> bool {
-                                matches!(self.discriminant, $(discriminant.name)::$(variant.name))
+                            pub fn $(variant.name)() -> Self {
+                                Self {
+                                    discriminant: $(discriminant.name)::$(variant.name),
+                                    payload: $(union.name) {
+                                        $(variant.name): (),
+                                    }
+                                }
                             }
                             """
+                        else
+                            variantCheck =
+                                """
+                                pub fn is_$(variant.name)(&self) -> bool {
+                                    matches!(self.discriminant, $(discriminant.name)::$(variant.name))
+                                }
+                                """
 
-                        borrowMut =
-                            """
-                            pub fn borrow_mut_$(variant.name)(&mut self) -> &mut $(variant.payload) {
-                                debug_assert_eq!(self.discriminant, $(discriminant.name)::$(variant.name));
-                                unsafe { &mut self.payload.$(variant.name) }
-                            }
-                            """
+                            borrowMut =
+                                """
+                                pub fn borrow_mut_$(variant.name)(&mut self) -> &mut $(variant.payload) {
+                                    debug_assert_eq!(self.discriminant, $(discriminant.name)::$(variant.name));
+                                    unsafe { &mut self.payload.$(variant.name) }
+                                }
+                                """
 
-                        constructor
-                        |> concatCode borrowMut
-                        |> concatCode variantCheck
+                            unwrapBorrow =
+                                if variant.isCopy then
+                                    # TODO: maybe rename the "borrow" methods to "copy_payload" or something more appropriate?
+                                    """
+                                    pub fn $(variant.name)(payload: $(variant.payload)) -> Self {
+                                        Self {
+                                            discriminant: $(discriminant.name)::$(variant.name),
+                                            payload: $(union.name) {
+                                                $(variant.name): payload,
+                                            }
+                                        }
+                                    }
+
+                                    pub fn unwrap_$(variant.name)(self) -> $(variant.payload) {
+                                        debug_assert_eq!(self.discriminant, $(discriminant.name)::$(variant.name));
+                                        unsafe { self.payload.$(variant.name) }
+                                    }
+
+                                    pub fn borrow_$(variant.name)(&mut self) -> $(variant.payload) {
+                                        debug_assert_eq!(self.discriminant, $(discriminant.name)::$(variant.name));
+                                        unsafe { self.payload.$(variant.name) }
+                                    }
+                                    """
+                                else
+                                    """
+                                    pub fn $(variant.name)(payload: $(variant.payload)) -> Self {
+                                        Self {
+                                            discriminant: $(discriminant.name)::$(variant.name),
+                                            payload: $(union.name) {
+                                                $(variant.name): core::mem::ManuallyDrop::new(payload),
+                                            }
+                                        }
+                                    }
+
+                                    pub fn unwrap_$(variant.name)(mut self) -> $(variant.payload) {
+                                        debug_assert_eq!(self.discriminant, $(discriminant.name)::$(variant.name));
+                                        unsafe { core::mem::ManuallyDrop::take(&mut self.payload.$(variant.name)) }
+                                    }
+
+                                    pub fn borrow_$(variant.name)(&mut self) -> &$(variant.payload) {
+                                        debug_assert_eq!(self.discriminant, $(discriminant.name)::$(variant.name));
+                                        unsafe { &self.payload.$(variant.name) }
+                                    }
+                                    """
+
+                            unwrapBorrow
+                            |> concatCode borrowMut
+                            |> concatCode variantCheck
                     |> Str.joinWith "\n\n"
 
                 (incMatchArms, decMatchArms) =
@@ -844,6 +846,26 @@ generateItemGroup = \itemGroup ->
                         |> Str.joinWith "\n"
 
                     (refcountMatchArms "inc", refcountMatchArms "dec")
+
+                fromRocMatchArms =
+                    variants
+                    |> List.map \variant ->
+                        if variant.payload == "()" then
+                            """
+                            $(discriminant.name)::$(variant.name) =>
+                                $(rustEnumName)::$(variant.name),
+                            """
+                        else if variant.isCopy then
+                            """
+                            $(discriminant.name)::$(variant.name) =>
+                                unsafe { $(rustEnumName)::$(variant.name)(item.payload.$(variant.name)) },
+                            """
+                        else
+                            """
+                            $(discriminant.name)::$(variant.name) =>
+                                unsafe { $(rustEnumName)::$(variant.name)(core::mem::ManuallyDrop::take(&mut item.payload.$(variant.name))) },
+                            """
+                    |> Str.joinWith "\n"
 
                 """
                 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -868,22 +890,17 @@ generateItemGroup = \itemGroup ->
                 /// a rust enum equivalent of $(name).
                 /// safer/more convenient to work with, but does require rearranging some memory to get.
                 #[repr(C)]
+                #[derive(Debug)]
                 #[derive($(derivesList traits))]
                 pub enum $(rustEnumName) {
                     $(rustEnumList |> indentedBy 1)
                 }
 
-                const _SIZE_CHECK_$(union.name): () =
-                    assert!(core::mem::size_of::<$(union.name)>() == $(union.size |> Num.toStr));
+                const _SIZE_CHECK_$(union.name): () = assert!(core::mem::size_of::<$(union.name)>() == $(union.size |> Num.toStr));
+                const _ALIGN_CHECK_$(union.name): () = assert!(core::mem::align_of::<$(union.name)>() == $(union.align |> Num.toStr));
 
-                const _ALIGN_CHECK_$(union.name): () =
-                    assert!(core::mem::align_of::<$(union.name)>() == $(union.align |> Num.toStr));
-
-                const _SIZE_CHECK_$(name): () =
-                    assert!(core::mem::size_of::<$(name)>() == $(size |> Num.toStr));
-
-                const _ALIGN_CHECK_$(name): () =
-                    assert!(core::mem::align_of::<$(name)>() == $(align |> Num.toStr));
+                const _SIZE_CHECK_$(name): () = assert!(core::mem::size_of::<$(name)>() == $(size |> Num.toStr));
+                const _ALIGN_CHECK_$(name): () = assert!(core::mem::align_of::<$(name)>() == $(align |> Num.toStr));
 
                 // tag constructors, variant check methods, and payload borrow/unwrap methods
                 impl $(name) {
@@ -896,28 +913,39 @@ generateItemGroup = \itemGroup ->
                 }
 
                 impl From<$(name)> for $(rustEnumName) {
-                    fn from(item: $(name)) -> Self {
-                        #[repr(C)]
-                        struct Temp {
-                            discriminant: $(discriminant.name),
-                            payload: $(union.name),
+                    fn from(mut item: $(name)) -> Self {
+                        // TODO: see if this can be done by rearranging memory like the other conversion without crashing mysteriously
+                        match item.discriminant {
+                            $(fromRocMatchArms |> indentedBy 3)
                         }
 
-                        // SAFETY: moving non-copy fields out of `item` is normally disallowed,
-                        // since we'd be circumventing the destructor. Since we mem::forget `item` after this,
-                        // and the newly created $(rustEnumName) is put in charge of running the destructors afterwards, this is safe.
-                        let with_swapped_fields = unsafe {
-                            Temp {
-                                discriminant: core::ptr::read(&item.discriminant),
-                                payload: core::ptr::read(&item.payload),
-                            }
-                        };
-
-                        core::mem::forget(item);
-
-                        // SAFETY: Temp has the same layout as a #[repr(C)] enum, which is what $(rustEnumName) is:
-                        // https://doc.rust-lang.org/reference/type-layout.html#reprc-enums-with-fields
-                        unsafe { core::mem::transmute::<Temp, $(rustEnumName)>(with_swapped_fields) }
+                        // #[repr(C)]
+                        // struct Temp {
+                        //     discriminant: $(discriminant.name),
+                        //     payload: $(union.name),
+                        // }
+                        // 
+                        // #[repr(C)]
+                        // struct Temp2 {
+                        //     payload: $(union.name),
+                        //     discriminant: $(discriminant.name),
+                        // }
+                        // 
+                        // // println!("DEBUG1: {:?}", item.discriminant);
+                        // 
+                        // let without_drop = unsafe { core::mem::transmute::<$(name), Temp2>(item) };
+                        // 
+                        // // SAFETY: moving non-copy fields out of `item` is normally disallowed,
+                        // // since we'd be circumventing the destructor. Since we mem::forget `item` after this,
+                        // // and the newly created $(rustEnumName) is put in charge of running the destructors afterwards, this is safe.
+                        // let with_swapped_fields = Temp {
+                        //     discriminant: without_drop.discriminant,
+                        //     payload: without_drop.payload,
+                        // };
+                        // 
+                        // // SAFETY: Temp has the same layout as a #[repr(C)] enum, which is what $(rustEnumName) is:
+                        // // https://doc.rust-lang.org/reference/type-layout.html#reprc-enums-with-fields
+                        // unsafe { core::mem::transmute::<Temp, $(rustEnumName)>(with_swapped_fields) }
                     }
                 }
 
@@ -948,6 +976,7 @@ generateItemGroup = \itemGroup ->
                             }
                         }
                     }
+
                     fn dec(&mut self) {
                         unsafe {
                             match self.discriminant {
@@ -955,6 +984,7 @@ generateItemGroup = \itemGroup ->
                             }
                         }
                     }
+
                     fn is_refcounted() -> bool { $(if Set.contains traits Copy then "false" else "true") }
                 }
 
