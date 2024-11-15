@@ -186,6 +186,13 @@ mod glue_cli_run {
             Answer was: "Hello World!"
             Answer was: discriminant_U1::None
         "#),
+        always_never:"always-never" => indoc!(r#"
+            main was: AlwaysNever::Always(306783378)
+        "#),
+        recursive_untagged:"recursive-untagged" => indoc!(r#"
+            expr constructed in Roc was: Expr::Concat(Expr::String("This is a test"), Expr::Tag17())
+            expr constructed in Rust was: Expr::Concat(Expr::String("This is a test"), Expr::Tag17())
+        "#),
         u128_i128:"u128-i128" => indoc!(r#"
             u128 was: 170141183460469231731687303715884105727
             i128 was: 85070591730234615865843651857942052863
