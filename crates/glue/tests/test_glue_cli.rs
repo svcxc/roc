@@ -169,6 +169,15 @@ mod glue_cli_tests {
         c_hello_world:"c/hello-world" => indoc!(r#"
             mainForHost = 42
         "#),
+        zig_basic_record:"zig/basic-record" => indoc!(r#"
+            Record field a was: 1995
+            Record field b was: 42
+        "#),
+        zig_enumeration:"zig/enumeration" => indoc!(r#"
+            Foo from Roc was: Foo
+            Foo from Zig was: Foo
+            tags: Bar, Baz, Foo
+        "#),
     }
 
     fn check_for_tests(all_fixtures: &mut roc_collections::VecSet<String>) {

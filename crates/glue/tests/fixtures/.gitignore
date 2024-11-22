@@ -5,6 +5,7 @@
 */*/Cargo.lock
 */*/Cargo.toml
 */*/host.c
+*/*/host.zig
 */*/build.rs
 */*/dynhost
 */*/.so
