@@ -3,11 +3,12 @@ app [makeGlue] { pf: platform "../platform/main.roc" }
 import pf.Types exposing [Types]
 import pf.File exposing [File]
 import pf.TypeId exposing [TypeId]
-import "../../compiler/builtins/bitcode/src/list.zig" as rocStdList : Str
-import "../../compiler/builtins/bitcode/src/str.zig" as rocStdStr : Str
-import "../../compiler/builtins/bitcode/src/utils.zig" as rocStdUtils : Str
-import "../../compiler/builtins/bitcode/src/sort.zig" as rocStdSort : Str
-import "../../compiler/builtins/bitcode/src/panic.zig" as rocStdPanic : Str
+# import "../../compiler/builtins/bitcode/src/list.zig" as rocStdList : Str
+# import "../../compiler/builtins/bitcode/src/str.zig" as rocStdStr : Str
+# import "../../compiler/builtins/bitcode/src/utils.zig" as rocStdUtils : Str
+# import "../../compiler/builtins/bitcode/src/sort.zig" as rocStdSort : Str
+# import "../../compiler/builtins/bitcode/src/panic.zig" as rocStdPanic : Str
+import "../static/str.zig" as rocStdStr : Str
 
 makeGlue : List Types -> Result (List File) Str
 makeGlue = \typesByArch ->
