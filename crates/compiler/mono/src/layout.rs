@@ -3835,25 +3835,27 @@ where
     // sort up front; make sure the ordering stays intact!
     tags_list.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
 
-    match tags_list.len() {
-        0 => {
+    match tags_list[..] {
+        [] => {
             // trying to instantiate a type with no values
             Cacheable(UnionVariant::Never, cache_criteria)
         }
-        1 => {
-            let &&(tag_name, arguments) = &tags_list[0];
+        [&(tag_name, arguments)] => {
             let tag_name = tag_name.clone().into();
 
             // just one tag in the union (but with arguments) can be a struct
             let mut layouts = Vec::with_capacity_in(tags_list.len(), env.arena);
 
             for &var in arguments {
+                if !env.subs.is_inhabited(var) {
+                    // single tag structs with an uninhabited payload may as well be `[]`
+                    return Cacheable(UnionVariant::Never, cache_criteria);
+                }
+
                 let Cacheable(result, criteria) = Layout::from_var(env, var);
                 cache_criteria.and(criteria, env.subs);
                 match result {
-                    Ok(layout) => {
-                        layouts.push(layout);
-                    }
+                    Ok(layout) => layouts.push(layout),
                     Err(LayoutProblem::UnresolvedTypeVar(_)) => {
                         // If we encounter an unbound type var (e.g. `Ok *`)
                         // then it's zero-sized; In the future we may drop this argument
@@ -3892,39 +3894,40 @@ where
                 )
             }
         }
-        num_tags => {
+        _ => {
             // default path
             let mut answer: Vec<(TagOrClosure, &[InLayout])> =
                 Vec::with_capacity_in(tags_list.len(), env.arena);
             let mut has_any_arguments = false;
 
-            let mut inhabited_tag_ids = BitVec::<usize>::repeat(true, num_tags);
+            let mut inhabited_tag_ids = BitVec::<usize>::repeat(true, tags_list.len());
 
             for &&(tag_name, arguments) in tags_list.iter() {
                 let mut arg_layouts = Vec::with_capacity_in(arguments.len() + 1, env.arena);
 
                 for &var in arguments {
-                    let Cacheable(result, criteria) = Layout::from_var(env, var);
-                    cache_criteria.and(criteria, env.subs);
-                    match result {
-                        Ok(layout) => {
-                            has_any_arguments = true;
+                    if !env.subs.is_inhabited(var) {
+                        // single tag structs with an uninhabited payload may as well be `[]`
+                        inhabited_tag_ids.set(answer.len(), false);
+                    } else {
+                        let Cacheable(result, criteria) = Layout::from_var(env, var);
+                        cache_criteria.and(criteria, env.subs);
+                        match result {
+                            Ok(layout) => {
+                                has_any_arguments = true;
 
-                            arg_layouts.push(layout);
-
-                            if layout == Layout::VOID {
-                                inhabited_tag_ids.set(answer.len(), false);
+                                arg_layouts.push(layout);
                             }
-                        }
-                        Err(LayoutProblem::UnresolvedTypeVar(_)) => {
-                            // If we encounter an unbound type var (e.g. `Ok *`)
-                            // then it's zero-sized; In the future we may drop this argument
-                            // completely, but for now we represent it with the empty tag union
-                            arg_layouts.push(Layout::VOID)
-                        }
-                        Err(LayoutProblem::Erroneous) => {
-                            // An erroneous type var will code gen to a runtime
-                            // error, so we don't need to store any data for it.
+                            Err(LayoutProblem::UnresolvedTypeVar(_)) => {
+                                // If we encounter an unbound type var (e.g. `Ok *`)
+                                // then it's zero-sized; In the future we may drop this argument
+                                // completely, but for now we represent it with the empty tag union
+                                arg_layouts.push(Layout::VOID)
+                            }
+                            Err(LayoutProblem::Erroneous) => {
+                                // An erroneous type var will code gen to a runtime
+                                // error, so we don't need to store any data for it.
+                            }
                         }
                     }
                 }
@@ -3945,19 +3948,38 @@ where
                 answer.push((tag_name.clone().into(), arg_layouts.into_bump_slice()));
             }
 
-            if inhabited_tag_ids.count_ones() == 1 && drop_uninhabited_variants.0 {
-                let kept_tag_id = inhabited_tag_ids.first_one().unwrap();
-                let kept = answer.get(kept_tag_id).unwrap();
-
-                let variant = UnionVariant::NewtypeByVoid {
-                    data_tag_name: kept.0.clone(),
-                    data_tag_id: kept_tag_id as _,
-                    data_tag_arguments: Vec::from_iter_in(kept.1.iter().copied(), env.arena),
+            let dropped_tags = inhabited_tag_ids.count_ones();
+            let num_tags = tags_list.len()
+                - if drop_uninhabited_variants.0 {
+                    dropped_tags
+                } else {
+                    0
                 };
-                return Cacheable(variant, cache_criteria);
-            }
+
+            // if num_tags == 1 && drop_uninhabited_variants.0 {
+            //     let kept_tag_id = inhabited_tag_ids.first_one().unwrap();
+            //     let kept = answer.get(kept_tag_id).unwrap();
+
+            //     let variant = UnionVariant::NewtypeByVoid {
+            //         data_tag_name: kept.0.clone(),
+            //         data_tag_id: kept_tag_id as _,
+            //         data_tag_arguments: Vec::from_iter_in(kept.1.iter().copied(), env.arena),
+            //     };
+            //     return Cacheable(variant, cache_criteria);
+            // }
 
             match num_tags {
+                1 if drop_uninhabited_variants.0 => {
+                    let kept_tag_id = inhabited_tag_ids.first_one().unwrap();
+                    let kept = answer.get(kept_tag_id).unwrap();
+
+                    let variant = UnionVariant::NewtypeByVoid {
+                        data_tag_name: kept.0.clone(),
+                        data_tag_id: kept_tag_id as _,
+                        data_tag_arguments: Vec::from_iter_in(kept.1.iter().copied(), env.arena),
+                    };
+                    Cacheable(variant, cache_criteria);
+                }
                 2 if !has_any_arguments => {
                     // type can be stored in a boolean
 
