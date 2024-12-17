@@ -264,7 +264,7 @@ impl Types {
                         NullableWrapped { tags: tags_a, .. },
                         NullableWrapped { tags: tags_b, .. },
                     ) => {
-                        if tags_a.len() != tags_b.len() {
+                        if tags_a.len() == tags_b.len() {
                             tags_a.iter().zip(tags_b.iter()).all(
                                 |((name_a, opt_id_a), (name_b, opt_id_b))| {
                                     name_a == name_b
