@@ -3,6 +3,7 @@ app [makeGlue] { pf: platform "../platform/main.roc" }
 import pf.Types exposing [Types]
 import pf.File exposing [File]
 import pf.TypeId exposing [TypeId]
+import pf.Target exposing [Architecture]
 import "../static/Cargo.toml" as rocAppCargoToml : Str
 import "../../roc_std/Cargo.toml" as rocStdCargoToml : Str
 import "../../roc_std/src/lib.rs" as rocStdLib : Str
@@ -215,6 +216,12 @@ supportedTraits = \types, type ->
             # isn't already disqualified from
             Set.fromList [Clone, PartialEq, Eq, PartialOrd, Ord, Hash]
 
+is64Bit : Architecture -> Bool
+is64Bit = \arch ->
+    when arch is
+        Aarch32 | Wasm32 | X86x32 -> Bool.true
+        Aarch64 | X86x64 -> Bool.false
+
 RustSymbol : Str
 RustType : Str
 
@@ -230,6 +237,11 @@ Trait : [
     Hash,
 ]
 
+Tags : List { name : Str, payload : [Some TypeId, None] }
+
+Variants : List { name : RustSymbol, payload : RustType, isCopy : Bool }
+
+# MARK: ItemGroup
 ItemGroup : [
     Entrypoint
         {
@@ -242,6 +254,12 @@ ItemGroup : [
         {
             name : RustSymbol,
             fields : List { name : RustSymbol, type : RustType },
+            derives : Set Trait,
+        },
+    TagUnionPayload
+        {
+            name : RustSymbol,
+            fields : List RustType,
             derives : Set Trait,
         },
     TagUnion
@@ -268,7 +286,7 @@ ItemGroup : [
                         size : U32,
                         align : U32,
                     },
-                    variants : List { name : RustSymbol, payload : RustType, isCopy : Bool },
+                    variants : Variants,
                     traits : Set Trait,
                 },
             SingleTagStruct
@@ -278,7 +296,26 @@ ItemGroup : [
                     fields : List RustType,
                     derives : Set Trait,
                 },
-            # Recursive,
+            RecursiveTagged
+                {
+                    name : RustSymbol,
+                    unionName : RustSymbol,
+                    discriminantName : RustSymbol,
+                    variants : Variants,
+                    traits : Set Trait,
+                },
+            RecursiveUntagged
+                {
+                    name : RustSymbol,
+                    variants : Variants,
+                    discriminant : {
+                        name : RustSymbol,
+                        size : U32,
+                        offset : U32,
+                    },
+                    unionName : RustSymbol,
+                    traits : Set Trait,
+                },
         ],
 ]
 
@@ -302,6 +339,24 @@ entrypoints = \types ->
 
                 _ -> ([], rustTypeName types type)
         Entrypoint { name, number: number + 1, args, ret }
+
+tagsToVariants : Types, Tags -> Variants
+tagsToVariants = \types, tags ->
+    List.map tags \tag ->
+        when tag.payload is
+            None ->
+                {
+                    name: tag.name,
+                    payload: "()",
+                    isCopy: Bool.true,
+                }
+
+            Some id ->
+                {
+                    name: tag.name,
+                    payload: rustTypeName types id,
+                    isCopy: supportedTraits types id |> Set.contains Copy,
+                }
 
 typesToItemGroups : Types -> List ItemGroup
 typesToItemGroups = \types ->
@@ -327,6 +382,21 @@ typeToItemGroup = \types, type ->
             }
             |> Ok
 
+        TagUnionPayload { name: recordName, fields: fields } ->
+            getFieldType = \{ id } -> rustTypeName types id
+
+            fieldTypes =
+                when fields is
+                    HasNoClosure list -> List.map list getFieldType
+                    HasClosure list -> List.map list getFieldType
+
+            TagUnionPayload {
+                name: escape recordName,
+                fields: fieldTypes,
+                derives: supportedTraits types type,
+            }
+            |> Ok
+
         TagUnion (Enumeration { name, tags, size }) ->
             Ok (TagUnion (Enumeration { name: escape name, repr: discriminantRepr size, tags }))
 
@@ -344,22 +414,6 @@ typeToItemGroup = \types, type ->
                         None -> acc
                 |> nextMultipleOf unionAlignment
 
-            variants = List.map tags \tag ->
-                when tag.payload is
-                    None ->
-                        {
-                            name: tag.name,
-                            payload: "()",
-                            isCopy: Bool.true,
-                        }
-
-                    Some id ->
-                        {
-                            name: tag.name,
-                            payload: rustTypeName types id,
-                            isCopy: supportedTraits types id |> Set.contains Copy,
-                        }
-
             {
                 name: escape name,
                 rustEnumName: "rusty_$(name)",
@@ -375,7 +429,7 @@ typeToItemGroup = \types, type ->
                     size: unionSize,
                     align: unionAlignment,
                 },
-                variants,
+                variants: tagsToVariants types tags,
                 traits: supportedTraits types type,
             }
             |> NonRecursive
@@ -400,8 +454,35 @@ typeToItemGroup = \types, type ->
             |> TagUnion
             |> Ok
 
-        # TagUnion (Recursive { name, tags, discriminantSize, discriminantOffset }) ->
-        # crash "todo"
+        TagUnion (Recursive { name, tags, discriminantSize, discriminantOffset }) ->
+            arch = (Types.target types).architecture
+
+            pointerTagCapacity = if is64Bit arch then 8 else 4
+
+            union =
+                if List.len tags > pointerTagCapacity then
+                    RecursiveUntagged {
+                        name: escape name,
+                        variants: tagsToVariants types tags,
+                        discriminant: {
+                            name: "discriminant_$(name)",
+                            size: discriminantSize,
+                            offset: discriminantOffset,
+                        },
+                        unionName: "union_$(name)",
+                        traits: supportedTraits types type,
+                    }
+                else
+                    RecursiveTagged {
+                        name: escape name,
+                        discriminantName: "discriminant_$(name)",
+                        unionName: "union_$(name)",
+                        variants: tagsToVariants types tags,
+                        traits: supportedTraits types type,
+                    }
+
+            Ok (TagUnion union)
+
         Function { isToplevel } if isToplevel ->
             # taken care of by `entrypoints`
             Err NoItemsNeeded
@@ -430,12 +511,9 @@ typeToItemGroup = \types, type ->
 discriminantRepr : U32 -> RustType
 discriminantRepr = \bytes ->
     when bytes is
-        0 -> crash "this is definitely a bug!"
         1 -> "u8"
         2 -> "u16"
-        3 | 4 -> "u32"
-        5 | 6 | 7 | 8 -> "u64"
-        _ -> crash "this is probably a bug!"
+        _ -> crash "non-u8/u16 tag union discriminants are not supported at the time of writing"
 
 nextMultipleOf = \lhs, rhs ->
     when lhs % rhs is
@@ -541,7 +619,8 @@ rustTypeName = \types, type ->
         Function { functionName } -> escape functionName
         TagUnionPayload { name } -> escape name
         Unit -> "()"
-        RecursivePointer _ | Unsized -> crash "what"
+        RecursivePointer content -> rustTypeName types content
+        Unsized -> crash "what"
         RocDict _ _ | RocSet _ -> crash "todo"
 
 ## indents all lines except the first so multiline substitions play nice in string interpolation
@@ -588,6 +667,7 @@ derivesList = \traits ->
             Hash -> "Hash"
     |> Str.joinWith ", "
 
+# MARK: generateItemGroup
 generateItemGroup : ItemGroup -> Str
 generateItemGroup = \itemGroup ->
     when itemGroup is
@@ -647,6 +727,50 @@ generateItemGroup = \itemGroup ->
             pub struct $(name) {
                 $(fieldList |> indentedBy 1)
             }
+
+            impl roc_std::RocRefcounted for $(name) {
+                fn inc(&mut self) {
+                    $(incs |> indentedBy 2)
+                }
+
+                fn dec(&mut self) {
+                    $(decs |> indentedBy 2)
+                }
+
+                fn is_refcounted() -> bool { $(refcounted) }
+            }
+            """
+
+        TagUnionPayload { name, fields, derives } ->
+            incs =
+                fields
+                |> List.mapWithIndex \_, i -> "self.$(Num.toStr i).inc();"
+                |> Str.joinWith "\n"
+
+            decs =
+                fields
+                |> List.mapWithIndex \_, i -> "self.$(Num.toStr i).dec();"
+                |> Str.joinWith "\n"
+
+            fieldList =
+                fields
+                |> List.map \fieldType -> "pub $(fieldType),"
+                |> Str.joinWith "\n"
+
+            refcounted =
+                if Set.contains derives Copy then
+                    "false"
+                else
+                    "true"
+
+            """
+            // this being a tuple struct is fine ABI-wise: https://doc.rust-lang.org/stable/nomicon/other-reprs.html#reprc:~:text=Tuple%20structs%20are%20like%20structs%20with%20regards%20to%20repr(C)%2C%20as%20the%20only%20difference%20from%20a%20struct%20is%20that%20the%20fields%20aren%E2%80%99t%20named.
+            #[repr(C)]
+            #[derive(Debug)]
+            #[derive($(derivesList derives))]
+            pub struct $(name)(
+                $(fieldList |> indentedBy 1)
+            );
 
             impl roc_std::RocRefcounted for $(name) {
                 fn inc(&mut self) {
@@ -869,7 +993,7 @@ generateItemGroup = \itemGroup ->
 
                 """
                 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-                #[repr($(discriminant.size |> discriminantRepr))]
+                #[repr($(discriminantRepr discriminant.size))]
                 pub enum $(discriminant.name) {
                     $(tagList |> indentedBy 1)
                 }
@@ -1317,3 +1441,80 @@ generateItemGroup = \itemGroup ->
             def
             |> concatCode debugSnippet
             |> concatCode refcountSnippet
+
+        TagUnion (RecursiveTagged { name, variants, traits: _, unionName, discriminantName }) ->
+            # MARK: RecursiveTagged
+            variantNames =
+                variants
+                |> List.map .name
+                |> Str.joinWith ", "
+
+            tagList =
+                variants
+                |> List.map \variant -> "$(variant.name),"
+                |> Str.joinWith "\n"
+
+            unionVariantList =
+                variants
+                |> List.map \variant ->
+                    if variant.isCopy then
+                        "$(variant.name): $(variant.payload),"
+                    else
+                        "$(variant.name): core::mem::ManuallyDrop<$(variant.payload)>,"
+                |> Str.joinWith "\n"
+
+            pointerTagMask = if List.len variants > 4 then "0b111" else "0b11"
+
+            constructors =
+                variants
+                |> List.mapWithIndex \variant, variantIndex ->
+                    """
+                    pub fn $(variant.name)(payload: $(variant.payload)) -> Self {
+                        let payload_union = $(unionName) { $(variant.name): payload };
+
+                        // TODO: look into how to implement RocRefcounted if RocBox isn't doing it
+                        let allocation_ptr = unsafe { roc_std::RocBox::leak(roc_std::RocBox::new(payload_union)) };
+
+                        let tagged_ptr = allocation_ptr as usize | $(Num.toStr variantIndex);
+
+                        Self { tagged_ptr }
+                    }
+
+                    pub fn is_$(variant.name)(&self) {
+                        matches!(self.discriminant(), $(discriminantName)::$(variant.name))
+                    }
+                    """
+                |> Str.joinWith "\n\n"
+
+            """
+            #[repr(transparent)]
+            pub struct $(name) {
+                tagged_ptr: usize,
+            }
+
+            // no repr(C) on this cause this is never used in interop
+            pub enum $(discriminantName) {
+                $(tagList |> indentedBy 1)
+            }
+
+            #[repr(C)]
+            pub union $(unionName) {
+                $(unionVariantList |> indentedBy 1)
+            }
+
+            impl $(name) {
+                pub fn discriminant(&self) -> $(discriminantName) {
+                    let discriminants = {
+                        use $(discriminantName)::*;
+
+                        [$(variantNames)]
+                    };
+
+                    self.0 as usize & $(pointerTagMask)
+                }
+
+                $(constructors |> indentedBy 1)
+            }
+            """
+
+        TagUnion (RecursiveUntagged _) -> crash "todo"
