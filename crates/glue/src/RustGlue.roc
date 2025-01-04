@@ -237,9 +237,11 @@ Trait : [
     Hash,
 ]
 
+# as received by the roc glue platform
 Tags : List { name : Str, payload : [Some TypeId, None] }
 
-Variants : List { name : RustSymbol, payload : RustType, isCopy : Bool }
+# as used in Rust code generation
+Variants : List { name : RustSymbol, payload : [None, Single RustType, Multiple { struct : RustType, types : List RustType }], isCopy : Bool }
 
 # MARK: ItemGroup
 ItemGroup : [
@@ -347,14 +349,30 @@ tagsToVariants = \types, tags ->
             None ->
                 {
                     name: tag.name,
-                    payload: "()",
+                    payload: None,
                     isCopy: Bool.true,
                 }
 
             Some id ->
+                name = rustTypeName types id
+
+                getPayloadTypeNames = \list ->
+                    List.map list \{ id: payloadId } ->
+                        rustTypeName types payloadId
+
+                payload =
+                    when Types.shape types id is
+                        TagUnionPayload { fields: HasNoClosure list } ->
+                            Multiple { struct: name, types: getPayloadTypeNames list }
+
+                        TagUnionPayload { fields: HasClosure list } ->
+                            Multiple { struct: name, types: getPayloadTypeNames list }
+
+                        _ -> Single name
+
                 {
                     name: tag.name,
-                    payload: rustTypeName types id,
+                    payload,
                     isCopy: supportedTraits types id |> Set.contains Copy,
                 }
 
@@ -382,6 +400,10 @@ typeToItemGroup = \types, type ->
             }
             |> Ok
 
+        # TagUnionPayload { fields: HasNoClosure [_] }
+        # | TagUnionPayload { fields: HasClosure [_] } ->
+        #     # `TagUnionPayload`s with just one payload are unwrapped
+        #     Err NoItemsNeeded
         TagUnionPayload { name: recordName, fields: fields } ->
             getFieldType = \{ id } -> rustTypeName types id
 
@@ -827,19 +849,25 @@ generateItemGroup = \itemGroup ->
                 unionVariantList =
                     variants
                     |> List.map \variant ->
+                        payload =
+                            when variant.payload is
+                                None -> "()"
+                                Single type -> type
+                                Multiple { struct } -> struct
+
                         if variant.isCopy then
-                            "$(variant.name): $(variant.payload),"
+                            "$(variant.name): $(payload),"
                         else
-                            "$(variant.name): core::mem::ManuallyDrop<$(variant.payload)>,"
+                            "$(variant.name): core::mem::ManuallyDrop<$(payload)>,"
                     |> Str.joinWith "\n"
 
                 rustEnumList =
                     variants
                     |> List.map \variant ->
-                        if variant.payload == "()" then
-                            "$(variant.name),"
-                        else
-                            "$(variant.name)($(variant.payload)),"
+                        when variant.payload is
+                            None -> "$(variant.name),"
+                            Single type | Multiple { struct: type } ->
+                                "$(variant.name)($(type)),"
                     |> Str.joinWith "\n"
 
                 debugMatchArms =
@@ -857,9 +885,13 @@ generateItemGroup = \itemGroup ->
                         #         f.debug_tuple("$(name)::$(variant.name)").field(payload).finish()
                         #     }
                         #     """
+                        payloadType =
+                            when variant.payload is
+                                None -> "()"
+                                Single payload | Multiple { struct: payload } -> payload
                         """
                         $(discriminant.name)::$(variant.name) => {
-                            let payload: &$(variant.payload) = &self.payload.$(variant.name);
+                            let payload: &$(payloadType) = &self.payload.$(variant.name);
                             f.debug_tuple("$(name)::$(variant.name)").field(payload).finish()
                         }
                         """
@@ -876,83 +908,131 @@ generateItemGroup = \itemGroup ->
                 constructors =
                     variants
                     |> List.map \variant ->
-                        # constructor =
                         # TODO: split these into appropriate unsafe "_unchecked" methods and checked and panic-y versions
-                        if variant.payload == "()" then
+                        # TODO: maybe change the `borrow_*()` method name to `copy_*()` if the payload is Copy? seems more intuitive
+                        variantCheck =
                             """
-                            pub fn $(variant.name)() -> Self {
-                                Self {
-                                    discriminant: $(discriminant.name)::$(variant.name),
-                                    payload: $(union.name) {
-                                        $(variant.name): (),
-                                    }
-                                }
+                            pub fn is_$(variant.name)(&self) -> bool {
+                                matches!(self.discriminant, $(discriminant.name)::$(variant.name))
                             }
                             """
-                        else
-                            variantCheck =
-                                """
-                                pub fn is_$(variant.name)(&self) -> bool {
-                                    matches!(self.discriminant, $(discriminant.name)::$(variant.name))
-                                }
-                                """
 
-                            borrowMut =
-                                """
-                                pub fn borrow_mut_$(variant.name)(&mut self) -> &mut $(variant.payload) {
-                                    debug_assert_eq!(self.discriminant, $(discriminant.name)::$(variant.name));
-                                    unsafe { &mut self.payload.$(variant.name) }
-                                }
-                                """
-
-                            unwrapBorrow =
-                                if variant.isCopy then
-                                    # TODO: maybe rename the "borrow" methods to "copy_payload" or something more appropriate?
+                        constructor =
+                            when variant.payload is
+                                None ->
                                     """
-                                    pub fn $(variant.name)(payload: $(variant.payload)) -> Self {
+                                    pub fn $(variant.name)() -> Self {
                                         Self {
                                             discriminant: $(discriminant.name)::$(variant.name),
                                             payload: $(union.name) {
-                                                $(variant.name): payload,
-                                            }
+                                                $(variant.name): (),
+                                            },
                                         }
                                     }
-
-                                    pub fn unwrap_$(variant.name)(self) -> $(variant.payload) {
-                                        debug_assert_eq!(self.discriminant, $(discriminant.name)::$(variant.name));
-                                        unsafe { self.payload.$(variant.name) }
-                                    }
-
-                                    pub fn borrow_$(variant.name)(&mut self) -> $(variant.payload) {
-                                        debug_assert_eq!(self.discriminant, $(discriminant.name)::$(variant.name));
-                                        unsafe { self.payload.$(variant.name) }
-                                    }
                                     """
-                                else
+
+                                Single type ->
+                                    payloadValue =
+                                        if variant.isCopy then "payload" else "core::mem::ManuallyDrop::new(payload)"
+
                                     """
-                                    pub fn $(variant.name)(payload: $(variant.payload)) -> Self {
+                                    pub fn $(variant.name)(payload: $(type)) -> Self {
                                         Self {
                                             discriminant: $(discriminant.name)::$(variant.name),
                                             payload: $(union.name) {
-                                                $(variant.name): core::mem::ManuallyDrop::new(payload),
-                                            }
+                                                $(variant.name): $(payloadValue),
+                                            },
                                         }
-                                    }
-
-                                    pub fn unwrap_$(variant.name)(mut self) -> $(variant.payload) {
-                                        debug_assert_eq!(self.discriminant, $(discriminant.name)::$(variant.name));
-                                        unsafe { core::mem::ManuallyDrop::take(&mut self.payload.$(variant.name)) }
-                                    }
-
-                                    pub fn borrow_$(variant.name)(&mut self) -> &$(variant.payload) {
-                                        debug_assert_eq!(self.discriminant, $(discriminant.name)::$(variant.name));
-                                        unsafe { &self.payload.$(variant.name) }
                                     }
                                     """
 
-                            unwrapBorrow
-                            |> concatCode borrowMut
-                            |> concatCode variantCheck
+                                Multiple { struct, types } ->
+                                    argList =
+                                        types
+                                        |> List.mapWithIndex \type, i -> "p$(Num.toStr i): $(type)"
+                                        |> Str.joinWith ", "
+
+                                    initList =
+                                        types
+                                        |> List.mapWithIndex \_, i -> "p$(Num.toStr i)"
+                                        |> Str.joinWith ", "
+
+                                    payloadValue =
+                                        if variant.isCopy then
+                                            "$(struct)($(initList))"
+                                        else
+                                            "core::mem::ManuallyDrop::new($(struct)($(initList)))"
+
+                                    """
+                                    pub fn $(variant.name)($(argList)) -> Self {
+                                        Self {
+                                            discriminant: $(discriminant.name)::$(variant.name),
+                                            payload: $(union.name) {
+                                                $(variant.name): $(payloadValue),
+                                            }
+                                        }
+                                    }
+                                    """
+
+                        borrowMut =
+                            when variant.payload is
+                                None -> Err NotApplicable
+                                Single payload | Multiple { struct: payload } ->
+                                    Ok
+                                        """
+                                        pub fn borrow_mut_$(variant.name)(&mut self) -> &mut $(payload) {
+                                            debug_assert_eq!(self.discriminant, $(discriminant.name)::$(variant.name));
+                                            unsafe { &mut self.payload.$(variant.name) }
+                                        }
+                                        """
+
+                        borrow =
+                            when variant.payload is
+                                None -> Err NotApplicable
+                                Single payload | Multiple { struct: payload } if variant.isCopy ->
+                                    Ok
+                                        """
+                                        pub fn borrow_$(variant.name)(&mut self) -> $(payload) {
+                                            debug_assert_eq!(self.discriminant, $(discriminant.name)::$(variant.name));
+                                            unsafe { self.payload.$(variant.name) }
+                                        }
+                                        """
+
+                                Single payload | Multiple { struct: payload } ->
+                                    Ok
+                                        """
+                                        pub fn borrow_$(variant.name)(&mut self) -> &$(payload) {
+                                            debug_assert_eq!(self.discriminant, $(discriminant.name)::$(variant.name));
+                                            unsafe { &self.payload.$(variant.name) }
+                                        }
+                                        """
+
+                        unwrap =
+                            when variant.payload is
+                                None -> Err NotApplicable
+                                Single payload | Multiple { struct: payload } if variant.isCopy ->
+                                    Ok
+                                        """
+                                        pub fn unwrap_$(variant.name)(self) -> $(payload) {
+                                            debug_assert_eq!(self.discriminant, $(discriminant.name)::$(variant.name));
+                                            unsafe { self.payload.$(variant.name) }
+                                        }
+                                        """
+
+                                Single payload | Multiple { struct: payload } ->
+                                    Ok
+                                        """
+                                        pub fn unwrap_$(variant.name)(mut self) -> $(payload) {
+                                            debug_assert_eq!(self.discriminant, $(discriminant.name)::$(variant.name));
+                                            unsafe { core::mem::ManuallyDrop::take(&mut self.payload.$(variant.name)) }
+                                        }
+                                        """
+
+                        variantCheck
+                        |> concatCode constructor
+                        |> appendIfOk unwrap
+                        |> appendIfOk borrow
+                        |> appendIfOk borrowMut
                     |> Str.joinWith "\n\n"
 
                 (incMatchArms, decMatchArms) =
@@ -974,7 +1054,7 @@ generateItemGroup = \itemGroup ->
                 fromRocMatchArms =
                     variants
                     |> List.map \variant ->
-                        if variant.payload == "()" then
+                        if variant.payload == None then
                             """
                             $(discriminant.name)::$(variant.name) =>
                                 $(rustEnumName)::$(variant.name),
@@ -990,6 +1070,68 @@ generateItemGroup = \itemGroup ->
                                 unsafe { $(rustEnumName)::$(variant.name)(core::mem::ManuallyDrop::take(&mut item.payload.$(variant.name))) },
                             """
                     |> Str.joinWith "\n"
+
+                conversions =
+                    # TODO: this bit is split off from the main string literal down below
+                    # because for some reason the roc compiler would crash with this bit in there?
+                    # not sure, might be worth looking into more later
+                    """
+                    impl From<$(name)> for $(rustEnumName) {
+                        fn from(mut item: $(name)) -> Self {
+                            // TODO: see if this can be done by rearranging memory like the other conversion without crashing mysteriously
+                            match item.discriminant {
+                                $(fromRocMatchArms |> indentedBy 3)
+                            }
+
+                            // #[repr(C)]
+                            // struct Temp {
+                            //     discriminant: $(discriminant.name),
+                            //     payload: $(union.name),
+                            // }
+                            // 
+                            // #[repr(C)]
+                            // struct Temp2 {
+                            //     payload: $(union.name),
+                            //     discriminant: $(discriminant.name),
+                            // }
+                            // 
+                            // // println!("DEBUG1: {:?}", item.discriminant);
+                            // 
+                            // let without_drop = unsafe { core::mem::transmute::<$(name), Temp2>(item) };
+                            // 
+                            // // SAFETY: moving non-copy fields out of `item` is normally disallowed,
+                            // // since we'd be circumventing the destructor. Since we mem::forget `item` after this,
+                            // // and the newly created $(rustEnumName) is put in charge of running the destructors afterwards, this is safe.
+                            // let with_swapped_fields = Temp {
+                            //     discriminant: without_drop.discriminant,
+                            //     payload: without_drop.payload,
+                            // };
+                            // 
+                            // // SAFETY: Temp has the same layout as a #[repr(C)] enum, which is what $(rustEnumName) is:
+                            // // https://doc.rust-lang.org/reference/type-layout.html#reprc-enums-with-fields
+                            // unsafe { core::mem::transmute::<Temp, $(rustEnumName)>(with_swapped_fields) }
+                        }
+                    }
+
+                    impl From<$(rustEnumName)> for $(name) {
+                        fn from(item: $(rustEnumName)) -> Self {
+                            #[repr(C)]
+                            struct Temp {
+                                discriminant: $(discriminant.name),
+                                payload: $(union.name),
+                            }
+
+                            // SAFETY: Temp has the same layout as a #[repr(C)] enum, which is what $(rustEnumName) is:
+                            // https://doc.rust-lang.org/reference/type-layout.html#reprc-enums-with-fields
+                            let decomposed = unsafe { core::mem::transmute::<$(rustEnumName), Temp>(item) };
+
+                            $(name) {
+                                payload: decomposed.payload,
+                                discriminant: decomposed.discriminant,
+                            }
+                        }
+                    }
+                    """
 
                 """
                 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1036,61 +1178,7 @@ generateItemGroup = \itemGroup ->
                     $(constructors |> indentedBy 1)
                 }
 
-                impl From<$(name)> for $(rustEnumName) {
-                    fn from(mut item: $(name)) -> Self {
-                        // TODO: see if this can be done by rearranging memory like the other conversion without crashing mysteriously
-                        match item.discriminant {
-                            $(fromRocMatchArms |> indentedBy 3)
-                        }
-
-                        // #[repr(C)]
-                        // struct Temp {
-                        //     discriminant: $(discriminant.name),
-                        //     payload: $(union.name),
-                        // }
-                        // 
-                        // #[repr(C)]
-                        // struct Temp2 {
-                        //     payload: $(union.name),
-                        //     discriminant: $(discriminant.name),
-                        // }
-                        // 
-                        // // println!("DEBUG1: {:?}", item.discriminant);
-                        // 
-                        // let without_drop = unsafe { core::mem::transmute::<$(name), Temp2>(item) };
-                        // 
-                        // // SAFETY: moving non-copy fields out of `item` is normally disallowed,
-                        // // since we'd be circumventing the destructor. Since we mem::forget `item` after this,
-                        // // and the newly created $(rustEnumName) is put in charge of running the destructors afterwards, this is safe.
-                        // let with_swapped_fields = Temp {
-                        //     discriminant: without_drop.discriminant,
-                        //     payload: without_drop.payload,
-                        // };
-                        // 
-                        // // SAFETY: Temp has the same layout as a #[repr(C)] enum, which is what $(rustEnumName) is:
-                        // // https://doc.rust-lang.org/reference/type-layout.html#reprc-enums-with-fields
-                        // unsafe { core::mem::transmute::<Temp, $(rustEnumName)>(with_swapped_fields) }
-                    }
-                }
-
-                impl From<$(rustEnumName)> for $(name) {
-                    fn from(item: $(rustEnumName)) -> Self {
-                        #[repr(C)]
-                        struct Temp {
-                            discriminant: $(discriminant.name),
-                            payload: $(union.name),
-                        }
-
-                        // SAFETY: Temp has the same layout as a #[repr(C)] enum, which is what $(rustEnumName) is:
-                        // https://doc.rust-lang.org/reference/type-layout.html#reprc-enums-with-fields
-                        let decomposed = unsafe { core::mem::transmute::<$(rustEnumName), Temp>(item) };
-
-                        $(name) {
-                            payload: decomposed.payload,
-                            discriminant: decomposed.discriminant,
-                        }
-                    }
-                }
+                $(conversions)
 
                 impl roc_std::RocRefcounted for $(name) {
                     fn inc(&mut self) {
@@ -1135,11 +1223,11 @@ generateItemGroup = \itemGroup ->
                 if Set.contains traits Copy then
                     Ok "impl Copy for $(name) {}"
                 else
-                    Err NoCopy
+                    Err NotApplicable
 
             dropSnippet =
                 if Set.contains traits Copy then
-                    Err NothingToDrop
+                    Err NotApplicable
                 else
                     matchArms =
                         variants
@@ -1188,7 +1276,7 @@ generateItemGroup = \itemGroup ->
                     """
                     |> Ok
                 else
-                    Err NoPartialEq
+                    Err NotApplicable
 
             eqSnippet =
                 if Set.contains traits Eq then
@@ -1235,7 +1323,7 @@ generateItemGroup = \itemGroup ->
                     """
                     |> Ok
                 else
-                    Err NotCloneable
+                    Err NotApplicable
 
             cmpSnippet =
                 if Set.contains traits Ord then
@@ -1295,7 +1383,7 @@ generateItemGroup = \itemGroup ->
                     """
                     |> Ok
                 else
-                    Err NotOrderable
+                    Err NotApplicable
 
             hashSnippet =
                 if Set.contains traits Hash then
@@ -1318,7 +1406,7 @@ generateItemGroup = \itemGroup ->
                     """
                     |> Ok
                 else
-                    Err NoHash
+                    Err NotApplicable
 
             commonSnippet
             |> appendIfOk cloneSnippet
@@ -1442,79 +1530,425 @@ generateItemGroup = \itemGroup ->
             |> concatCode debugSnippet
             |> concatCode refcountSnippet
 
-        TagUnion (RecursiveTagged { name, variants, traits: _, unionName, discriminantName }) ->
-            # MARK: RecursiveTagged
-            variantNames =
-                variants
-                |> List.map .name
-                |> Str.joinWith ", "
+        TagUnion (RecursiveTagged info) ->
+            recursiveTagged info
 
-            tagList =
-                variants
-                |> List.map \variant -> "$(variant.name),"
-                |> Str.joinWith "\n"
+        TagUnion (RecursiveUntagged _) -> crash "todo"
 
-            unionVariantList =
-                variants
-                |> List.map \variant ->
-                    if variant.isCopy then
-                        "$(variant.name): $(variant.payload),"
-                    else
-                        "$(variant.name): core::mem::ManuallyDrop<$(variant.payload)>,"
-                |> Str.joinWith "\n"
+recursiveTagged : _ -> Str
+recursiveTagged = \info ->
+    { name, variants, unionName, discriminantName } = info
 
-            pointerTagMask = if List.len variants > 4 then "0b111" else "0b11"
+    variantNames =
+        variants
+        |> List.map .name
+        |> Str.joinWith ", "
 
-            constructors =
-                variants
-                |> List.mapWithIndex \variant, variantIndex ->
+    tagList =
+        variants
+        |> List.map \variant -> "$(variant.name),"
+        |> Str.joinWith "\n"
+
+    unionVariantList =
+        variants
+        |> List.map \variant ->
+            payload =
+                when variant.payload is
+                    None -> "()"
+                    Single type | Multiple { struct: type } -> type
+
+            if variant.isCopy then
+                "$(variant.name): $(payload),"
+            else
+                "$(variant.name): core::mem::ManuallyDrop<$(payload)>,"
+        |> Str.joinWith "\n"
+
+    pointerTagMask = if List.len variants > 4 then "0b111usize" else "0b11usize"
+
+    """
+    #[repr(transparent)]
+    pub struct $(name) {
+        // points to a `$(unionName)`
+        tagged_ptr: usize,
+    }
+
+    // no repr(C) on this cause this is never used in interop
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub enum $(discriminantName) {
+        $(tagList |> indentedBy 1)
+    }
+
+    #[repr(C)]
+    pub union $(unionName) {
+        $(unionVariantList |> indentedBy 1)
+    }
+
+    impl $(name) {
+        pub fn discriminant(&self) -> $(discriminantName) {
+            let discriminants = {
+                use $(discriminantName)::*;
+
+                [$(variantNames)]
+            };
+
+            discriminants[self.tagged_ptr & $(pointerTagMask)]
+        }
+
+        pub fn union_ptr(&self) -> *mut $(unionName) {
+            (self.tagged_ptr & !$(pointerTagMask)) as *mut _
+        }
+
+        $(recursiveTaggedConstructors info |> indentedBy 1)
+    }
+
+    $(recursiveTaggedDebugImpl info)
+
+    $(recursiveTaggedRefcountingImpl info)
+
+    // we're using a leaked RocBox allocation to store this union,
+    // and RocBox requires RocRefcounted to be implemented on its child type.
+    // however, since refcounting is handled through the `$(name)` type, these functions
+    // will never actually be called, so they can be left blank.
+    // TODO: is there a way to avoid this dummy implementation?
+    $(dummyRefcountImpl unionName)
+    """
+    |> appendIfOk (recursiveTaggedCloneImpl info)
+    |> appendIfOk (recursiveTaggedOrderingImpl info)
+    |> appendIfOk (recursiveTaggedEqualityImpl info)
+    |> appendIfOk (recursiveTaggedHashImpl info)
+
+recursiveTaggedConstructors : _ -> Str
+recursiveTaggedConstructors = \{ variants, discriminantName, unionName } ->
+    variantMethods = \variant ->
+        variantCheck =
+            """
+            pub fn is_$(variant.name)(&self) -> bool {
+                matches!(self.discriminant(), $(discriminantName)::$(variant.name))
+            }
+            """
+
+        constructor =
+            when variant.payload is
+                None -> crash "this kind of tag union should have payloads on every tag"
+                Single type ->
+                    payloadValue =
+                        if variant.isCopy then "payload" else "core::mem::ManuallyDrop::new(payload)"
+
                     """
-                    pub fn $(variant.name)(payload: $(variant.payload)) -> Self {
-                        let payload_union = $(unionName) { $(variant.name): payload };
+                    pub fn $(variant.name)(payload: $(type)) -> Self {
+                        let payload_union = $(unionName) { $(variant.name): $(payloadValue) };
 
-                        // TODO: look into how to implement RocRefcounted if RocBox isn't doing it
                         let allocation_ptr = unsafe { roc_std::RocBox::leak(roc_std::RocBox::new(payload_union)) };
 
-                        let tagged_ptr = allocation_ptr as usize | $(Num.toStr variantIndex);
+                        let tagged_ptr = (allocation_ptr as usize) | ($(discriminantName)::$(variant.name) as usize);
+
+                        Self { tagged_ptr }
+                    }
+                    """
+
+                Multiple { struct, types } ->
+                    argList =
+                        types
+                        |> List.mapWithIndex \type, i -> "p$(Num.toStr i): $(type)"
+                        |> Str.joinWith ", "
+
+                    initList =
+                        types
+                        |> List.mapWithIndex \_, i -> "p$(Num.toStr i)"
+                        |> Str.joinWith ", "
+
+                    payloadValue =
+                        if variant.isCopy then
+                            "payload"
+                        else
+                            "core::mem::ManuallyDrop::new(payload)"
+
+                    """
+                    pub fn $(variant.name)_from_payload_struct(payload: $(struct)) -> Self {
+                        let payload_union = $(unionName) { $(variant.name): $(payloadValue) };
+
+                        let allocation_ptr = unsafe { roc_std::RocBox::leak(roc_std::RocBox::new(payload_union)) };
+
+                        let tagged_ptr = (allocation_ptr as usize) | ($(discriminantName)::$(variant.name) as usize);
 
                         Self { tagged_ptr }
                     }
 
-                    pub fn is_$(variant.name)(&self) {
-                        matches!(self.discriminant(), $(discriminantName)::$(variant.name))
+                    pub fn $(variant.name)($(argList)) -> Self {
+                        Self::$(variant.name)_from_payload_struct($(struct)($(initList)))
                     }
                     """
-                |> Str.joinWith "\n\n"
 
-            """
-            #[repr(transparent)]
-            pub struct $(name) {
-                tagged_ptr: usize,
-            }
+        concatCode variantCheck constructor
 
-            // no repr(C) on this cause this is never used in interop
-            pub enum $(discriminantName) {
-                $(tagList |> indentedBy 1)
-            }
+    variants
+    |> List.map variantMethods
+    |> Str.joinWith "\n\n"
 
-            #[repr(C)]
-            pub union $(unionName) {
-                $(unionVariantList |> indentedBy 1)
-            }
+recursiveTaggedDebugImpl : _ -> Str
+recursiveTaggedDebugImpl = \{ name, discriminantName, variants } ->
+    matchArms =
+        variants
+        |> List.map \variant ->
+            when variant.payload is
+                None ->
+                    """
+                    $(discriminantName)::$(variant.name) =>
+                        f.write_str("$(name)::$(variant.name)"),
+                    """
 
-            impl $(name) {
-                pub fn discriminant(&self) -> $(discriminantName) {
-                    let discriminants = {
-                        use $(discriminantName)::*;
+                Single payload ->
+                    """
+                    $(discriminantName)::$(variant.name) => {
+                        let payload: &$(payload) = &(*self.union_ptr()).$(variant.name);
+                        f.debug_tuple("$(name)::$(variant.name)")
+                            .field(payload)
+                            .finish()
+                    }
+                    """
 
-                        [$(variantNames)]
-                    };
+                Multiple { struct, types } ->
+                    fieldBuilders =
+                        types
+                        |> List.mapWithIndex \_, i -> ".field(&payload.$(Num.toStr i))"
+                        |> Str.joinWith "\n"
 
-                    self.0 as usize & $(pointerTagMask)
+                    """
+                    $(discriminantName)::$(variant.name) => {
+                        let payload: &$(struct) = &((*self.union_ptr()).$(variant.name));
+                        f.debug_tuple("$(name)::$(variant.name)")
+                            $(fieldBuilders |> indentedBy 2)
+                            .finish()
+                    }
+                    """
+        |> Str.joinWith "\n\n"
+
+    """
+    impl core::fmt::Debug for $(name) {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            unsafe {
+                match self.discriminant() {
+                    $(matchArms |> indentedBy 4)
                 }
+            }
+        }
+    }
+    """
 
-                $(constructors |> indentedBy 1)
+recursiveTaggedRefcountingImpl : _ -> Str
+recursiveTaggedRefcountingImpl = \{ name, discriminantName, variants, traits } ->
+    if Set.contains traits Copy then
+        """
+        roc_refcounted_noop_impl!($(name));
+        """
+    else
+        matchArms = \incOrDec ->
+            variants
+            |> List.map \variant ->
+                if variant.isCopy then
+                    """
+                    $(discriminantName)::$(variant.name) =>
+                        (*self.union_ptr()).$(variant.name).$(incOrDec)(),
+                    """
+                else
+                    """
+                    $(discriminantName)::$(variant.name) =>
+                        (*(*self.union_ptr()).$(variant.name)).$(incOrDec)(),
+                    """
+            |> Str.joinWith "\n\n"
+
+        """
+        impl roc_std::RocRefcounted for $(name) {
+            fn inc(&mut self) {
+                unsafe {
+                    match self.discriminant() {
+                        $(matchArms "inc" |> indentedBy 3)
+                    }
+                }
+            }
+
+            fn dec(&mut self) {
+                unsafe {
+                    match self.discriminant() {
+                        $(matchArms "dec" |> indentedBy 3)
+                    }
+                }
+            }
+
+            fn is_refcounted() -> bool { true }
+        }
+        """
+
+dummyRefcountImpl : RustType -> Str
+dummyRefcountImpl = \name ->
+    """
+    impl roc_std::RocRefcounted for $(name) {
+        fn inc(&mut self) { unimplemented!(); }
+        fn dec(&mut self) { unimplemented!(); }
+        fn is_refcounted() -> bool { unimplemented!(); }
+    }
+    """
+
+recursiveTaggedCloneImpl : _ -> Result Str [NotApplicable]
+recursiveTaggedCloneImpl = \{ name, discriminantName, variants, traits } ->
+    if Set.contains traits Clone then
+        matchArms =
+            variants
+            |> List.map \variant ->
+                constructorName =
+                    # at time of writing, removing this indirection causes the roc compiler to crash on build.
+                    # TODO: make a minimal reproduction, if it still exists
+                    payload = variant.payload
+                    when payload is
+                        Multiple _ -> "Self::$(variant.name)_from_payload_struct"
+                        _ -> "Self::$(variant.name)"
+
+                clonedPayload =
+                    if variant.isCopy then
+                        "(*self.union_ptr()).$(variant.name)"
+                    else
+                        "(*(*self.union_ptr()).$(variant.name)).clone()"
+
+                """
+                $(discriminantName)::$(variant.name) =>
+                    $(constructorName)(
+                        $(clonedPayload)
+                    ),
+                """
+            |> Str.joinWith "\n\n"
+
+        """
+        impl core::clone::Clone for $(name) {
+            fn clone(&self) -> Self {
+                unsafe {
+                    match self.discriminant() {
+                        $(matchArms |> indentedBy 4)
+                    }
+                }
+            }
+        }
+        """
+        |> Ok
+    else
+        Err NotApplicable
+
+recursiveTaggedOrderingImpl : _ -> Result Str [NotApplicable]
+recursiveTaggedOrderingImpl = \{ name, discriminantName, variants, traits } ->
+    if Set.contains traits Ord then
+        matchArms =
+            variants
+            |> List.map \variant ->
+                "$(discriminantName)::$(variant.name) => (*self.union_ptr()).$(variant.name).cmp(&(*other.union_ptr()).$(variant.name)),"
+            |> Str.joinWith "\n"
+
+        """
+        impl core::cmp::Ord for $(name) {
+            fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+                match self.discriminant().cmp(&other.discriminant()) {
+                    core::cmp::Ordering::Less => core::cmp::Ordering::Less,
+                    core::cmp::Ordering::Greater => core::cmp::Ordering::Greater,
+                    core::cmp::Ordering::Equal =>
+                        // SAFETY: self.discriminant() checked below, other.discriminant() checked by virtue of them being checked to be equal above
+                        unsafe {
+                            match self.discriminant() {
+                                $(matchArms |> indentedBy 6)
+                            }
+                        },
+                }
+            }
+        }
+
+        impl core::cmp::PartialOrd for $(name) {
+            fn partial_cmp(&self, other: &Self) -> core::option::Option<core::cmp::Ordering> {
+                core::option::Option::Some(self.cmp(other))
+            }
+        }
+        """
+        |> Ok
+    else if Set.contains traits PartialOrd then
+        matchArms =
+            variants
+            |> List.map \variant ->
+                "$(discriminantName)::$(variant.name) => (*self.union_ptr()).$(variant.name).partial_cmp(&(*other.union_ptr()).$(variant.name)),"
+            |> Str.joinWith "\n"
+
+        """
+        impl core::cmp::PartialOrd for $(name) {
+            fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+                match self.discriminant().cmp(&other.discriminant()) {
+                    core::cmp::Ordering::Less => Option::Some(core::cmp::Ordering::Less),
+                    core::cmp::Ordering::Greater => Option::Some(core::cmp::Ordering::Greater),
+                    core::cmp::Ordering::Equal =>
+                        // SAFETY: self.discriminant() checked below, other.discriminant() checked in virtue of them being checked to be equal above
+                        unsafe {
+                            match self.discriminant() {
+                                $(matchArms |> indentedBy 6)
+                            }
+                        },
+                }
+            }
+        }
+        """
+        |> Ok
+    else
+        Err NotApplicable
+
+recursiveTaggedEqualityImpl : _ -> Result Str [NotApplicable]
+recursiveTaggedEqualityImpl = \{ name, variants, discriminantName, traits } ->
+    if Set.contains traits PartialEq then
+        matchArms =
+            variants
+            |> List.map \variant ->
+                "$(discriminantName)::$(variant.name) => (*self.union_ptr()).$(variant.name) == (*other.union_ptr()).$(variant.name),"
+            |> Str.joinWith "\n"
+
+        partialEq =
+            """
+            impl PartialEq for $(name) {
+                fn eq(&self, other: &Self) -> bool {
+                    if self.discriminant() != other.discriminant() {
+                        return false;
+                    }
+
+                    // SAFETY: `self.discriminant()` is matched upon, `other.discriminant()` was checked above
+                    unsafe {
+                        match self.discriminant() {
+                            $(matchArms |> indentedBy 4)
+                        }
+                    }
+                }
             }
             """
 
-        TagUnion (RecursiveUntagged _) -> crash "todo"
+        if Set.contains traits Eq then
+            Ok (concatCode partialEq "impl Eq for $(name) {}")
+        else
+            Ok partialEq
+    else
+        Err NotApplicable
+
+recursiveTaggedHashImpl : _ -> Result Str [NotApplicable]
+recursiveTaggedHashImpl = \{ name, traits, variants, discriminantName } ->
+    if Set.contains traits Hash then
+        matchArms =
+            variants
+            |> List.map \variant -> "$(discriminantName)::$(variant.name) => (*self.union_ptr()).$(variant.name).hash(state),"
+            |> Str.joinWith "\n\n"
+
+        """
+        impl core::hash::Hash for $(name) {
+            fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+                // TODO: this hashes the pointer, mirroring what `Box` does. Is this acceptable?
+                self.discriminant().hash(state);
+
+                unsafe {
+                    match self.discriminant() {
+                        $(matchArms |> indentedBy 4)
+                    }
+                }
+            }
+        }
+        """
+        |> Ok
+    else
+        Err NotApplicable
