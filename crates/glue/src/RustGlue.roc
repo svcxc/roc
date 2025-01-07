@@ -254,8 +254,7 @@ ItemGroup : [
             Enumeration Enumeration,
             NonRecursive NonRecursive,
             SingleTagStruct SingleTagStruct,
-            RecursiveTagged RecursiveTagged,
-            RecursiveUntagged RecursiveUntagged,
+            Recursive Recursive,
         ],
 ]
 
@@ -310,23 +309,19 @@ SingleTagStruct : {
     derives : Set Trait,
 }
 
-RecursiveTagged : {
+Recursive : {
     name : RustSymbol,
     unionName : RustSymbol,
     discriminantName : RustSymbol,
+    discriminantStorage : [
+        Heap {
+            offset : U32,
+            size: U32,
+            allocName : RustType,
+        },
+        PointerTagging,
+    ],
     variants : Variants,
-    traits : Set Trait,
-}
-
-RecursiveUntagged : {
-    name : RustSymbol,
-    variants : Variants,
-    discriminant : {
-        name : RustSymbol,
-        size : U32,
-        offset : U32,
-    },
-    unionName : RustSymbol,
     traits : Set Trait,
 }
 
@@ -486,28 +481,25 @@ typeToItemGroup = \types, type ->
 
             pointerTagCapacity = if is64Bit arch then 8 else 4
 
-            union =
+            discriminantStorage = 
                 if List.len tags > pointerTagCapacity then
-                    RecursiveUntagged {
-                        name: escape name,
-                        variants: tagsToVariants types tags,
-                        discriminant: {
-                            name: "discriminant_$(name)",
-                            size: discriminantSize,
-                            offset: discriminantOffset,
-                        },
-                        unionName: "union_$(name)",
-                        traits: supportedTraits types type,
+                    Heap {
+                        size: discriminantSize,
+                        offset: discriminantOffset,
+                        allocName: "allocation_$(name)",
                     }
                 else
-                    RecursiveTagged {
-                        name: escape name,
-                        discriminantName: "discriminant_$(name)",
-                        unionName: "union_$(name)",
-                        variants: tagsToVariants types tags,
-                        traits: supportedTraits types type,
-                    }
+                    PointerTagging
 
+            union = Recursive {
+                name: escape name,
+                discriminantName: "discriminant_$(name)",
+                discriminantStorage,
+                unionName: "union_$(name)",
+                variants: tagsToVariants types tags,
+                traits: supportedTraits types type,
+            }
+            
             Ok (TagUnion union)
 
         Function { isToplevel } if isToplevel ->
@@ -716,11 +708,8 @@ generateItemGroup = \itemGroup ->
         TagUnion (SingleTagStruct info) ->
             singleTagStruct info
 
-        TagUnion (RecursiveTagged info) ->
-            recursiveTagged info
-
-        TagUnion (RecursiveUntagged _) ->
-            crash "todo"
+        TagUnion (Recursive info) ->
+            recursive info
 
 entrypoint : Entrypoint -> Code
 entrypoint = \{ name, number, args, ret } ->
@@ -986,9 +975,9 @@ singleTagStruct = \{ name, tagName, fields, derives } ->
     |> concatCode debugSnippet
     |> concatCode refcountSnippet
 
-recursiveTagged : RecursiveTagged -> Code
-recursiveTagged = \info ->
-    { name, variants, unionName, discriminantName } = info
+recursive : Recursive -> Code
+recursive = \info ->
+    { name, variants, unionName, discriminantName, discriminantStorage } = info
 
     variantNames =
         variants
@@ -997,7 +986,7 @@ recursiveTagged = \info ->
 
     tagList =
         variants
-        |> List.map \variant -> "$(variant.name),"
+        |> List.mapWithIndex \variant, i -> "$(variant.name) = $(Num.toStr i),"
         |> Str.joinWith "\n"
 
     unionVariantList =
@@ -1013,55 +1002,110 @@ recursiveTagged = \info ->
             else
                 "$(variant.name): core::mem::ManuallyDrop<$(payload)>,"
         |> Str.joinWith "\n"
+    
+    common =
+        when discriminantStorage is
+            PointerTagging ->
+                pointerTagMask = if List.len variants > 4 then "0b111usize" else "0b11usize"
 
-    pointerTagMask = if List.len variants > 4 then "0b111usize" else "0b11usize"
+                """
+                #[repr(transparent)]
+                pub struct $(name) {
+                    // points to a `$(unionName)`
+                    tagged_ptr: usize,
+                }
 
-    """
-    #[repr(transparent)]
-    pub struct $(name) {
-        // points to a `$(unionName)`
-        tagged_ptr: usize,
-    }
+                // no repr(C) on this cause this is never used in interop
+                #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+                pub enum $(discriminantName) {
+                    $(tagList |> indentedBy 1)
+                }
 
-    // no repr(C) on this cause this is never used in interop
-    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub enum $(discriminantName) {
-        $(tagList |> indentedBy 1)
-    }
+                #[repr(C)]
+                pub union $(unionName) {
+                    $(unionVariantList |> indentedBy 1)
+                }
 
-    #[repr(C)]
-    pub union $(unionName) {
-        $(unionVariantList |> indentedBy 1)
-    }
+                impl $(name) {
+                    pub fn discriminant(&self) -> $(discriminantName) {
+                        let discriminants = {
+                            use $(discriminantName)::*;
 
-    impl $(name) {
-        pub fn discriminant(&self) -> $(discriminantName) {
-            let discriminants = {
-                use $(discriminantName)::*;
+                            [$(variantNames)]
+                        };
 
-                [$(variantNames)]
-            };
+                        discriminants[self.tagged_ptr & $(pointerTagMask)]
+                    }
 
-            discriminants[self.tagged_ptr & $(pointerTagMask)]
-        }
+                    pub fn union_ptr(&self) -> *mut $(unionName) {
+                        (self.tagged_ptr & !$(pointerTagMask)) as *mut _
+                    }
+                }
 
-        pub fn union_ptr(&self) -> *mut $(unionName) {
-            (self.tagged_ptr & !$(pointerTagMask)) as *mut _
-        }
-    }
-    """
-    |> concatCode (recursiveTaggedConstructors info)
-    |> concatCode (recursiveTaggedDebugImpl info)
-    |> concatCode (recursiveTaggedRefcountingImpl info)
-    |> concatCode (recursiveTaggedDummyUnionRefcountImpl info)
-    |> appendIfOk (recursiveTaggedCloneImpl info)
-    |> appendIfOk (recursiveTaggedDropImpl info)
-    |> appendIfOk (recursiveTaggedOrderingImpl info)
-    |> appendIfOk (recursiveTaggedEqualityImpl info)
-    |> appendIfOk (recursiveTaggedHashImpl info)
+                // we're using a leaked RocBox allocation to store this union,
+                // and RocBox requires RocRefcounted to be implemented on its child type.
+                // however, since refcounting is handled through the `$(name)` type, these functions
+                // will never actually be called, so they can be left blank.
+                // TODO: is there a way to avoid this dummy implementation?
+                $(dummyRefcountImpl unionName)
+                """
+            
+            Heap { allocName } ->
+                """
+                #[repr(transparent)]
+                pub struct $(name) {
+                    ptr: *mut $(allocName),
+                }
 
-recursiveTaggedConstructors : RecursiveTagged -> Code
-recursiveTaggedConstructors = \{ name, variants, discriminantName, unionName } ->
+                #[repr(C)]
+                struct $(allocName) {
+                    payload: $(unionName),
+                    discriminant: $(discriminantName),
+                }
+
+                #[repr(C)]
+                #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+                pub enum $(discriminantName) {
+                    $(tagList |> indentedBy 1)
+                }
+
+                #[repr(C)]
+                pub union $(unionName) {
+                    $(unionVariantList |> indentedBy 1)
+                }
+
+                impl $(name) {
+                    pub fn discriminant(&self) -> $(discriminantName) {
+                        unsafe { (*self.ptr).discriminant }
+                    }
+
+                    pub fn union_ptr(&self) -> *mut $(unionName) {
+                        unsafe { &mut (*self.ptr).payload }
+                    }
+                }
+
+                // we're using a leaked RocBox allocation to store this union,
+                // and RocBox requires RocRefcounted to be implemented on its child type.
+                // however, since refcounting is handled through the `$(name)` type, these functions
+                // will never actually be called, so they can be left blank.
+                // TODO: is there a way to avoid this dummy implementation?
+                $(dummyRefcountImpl allocName)
+                """
+
+
+
+    common
+    |> concatCode (recursiveConstructors info)
+    |> concatCode (recursiveDebugImpl info)
+    |> concatCode (recursiveRefcountingImpl info)
+    |> appendIfOk (recursiveCloneImpl info)
+    |> appendIfOk (recursiveDropImpl info)
+    |> appendIfOk (recursiveOrderingImpl info)
+    |> appendIfOk (recursiveEqualityImpl info)
+    |> appendIfOk (recursiveHashImpl info)
+
+recursiveConstructors : Recursive -> Code
+recursiveConstructors = \{ name, variants, discriminantName, discriminantStorage, unionName } ->
     variantMethods = \variant ->
         variantCheck =
             """
@@ -1071,23 +1115,39 @@ recursiveTaggedConstructors = \{ name, variants, discriminantName, unionName } -
             """
 
         constructor =
+            payloadValue =
+                if variant.isCopy then "payload" else "core::mem::ManuallyDrop::new(payload)"
+            
             when variant.payload is
                 None -> crash "this kind of tag union should have payloads on every tag"
                 Single type ->
-                    payloadValue =
-                        if variant.isCopy then "payload" else "core::mem::ManuallyDrop::new(payload)"
+                    when discriminantStorage is
+                        PointerTagging ->
+                            """
+                            pub fn $(variant.name)(payload: $(type)) -> Self {
+                                let payload_union = $(unionName) { $(variant.name): $(payloadValue) };
 
-                    """
-                    pub fn $(variant.name)(payload: $(type)) -> Self {
-                        let payload_union = $(unionName) { $(variant.name): $(payloadValue) };
+                                let allocation_ptr = unsafe { roc_std::RocBox::leak(roc_std::RocBox::new(payload_union)) };
 
-                        let allocation_ptr = unsafe { roc_std::RocBox::leak(roc_std::RocBox::new(payload_union)) };
+                                let tagged_ptr = (allocation_ptr as usize) | ($(discriminantName)::$(variant.name) as usize);
 
-                        let tagged_ptr = (allocation_ptr as usize) | ($(discriminantName)::$(variant.name) as usize);
+                                Self { tagged_ptr }
+                            }
+                            """
+                        
+                        Heap { allocName } ->
+                            """
+                            pub fn $(variant.name)(payload: $(type)) -> Self {
+                                let tagged_union = $(allocName) {
+                                    discriminant: $(discriminantName)::$(variant.name),
+                                    payload: $(unionName) { $(variant.name): $(payloadValue) },
+                                };
 
-                        Self { tagged_ptr }
-                    }
-                    """
+                                let ptr = unsafe { roc_std::RocBox::leak(roc_std::RocBox::new(tagged_union)) };
+
+                                Self { ptr }
+                            }
+                            """
 
                 Multiple { struct, types } ->
                     argList =
@@ -1100,27 +1160,42 @@ recursiveTaggedConstructors = \{ name, variants, discriminantName, unionName } -
                         |> List.mapWithIndex \_, i -> "p$(Num.toStr i)"
                         |> Str.joinWith ", "
 
-                    payloadValue =
-                        if variant.isCopy then
-                            "payload"
-                        else
-                            "core::mem::ManuallyDrop::new(payload)"
+                    when discriminantStorage is
+                        PointerTagging ->
+                            """
+                            pub fn $(variant.name)_from_payload_struct(payload: $(struct)) -> Self {
+                                let payload_union = $(unionName) { $(variant.name): $(payloadValue) };
 
-                    """
-                    pub fn $(variant.name)_from_payload_struct(payload: $(struct)) -> Self {
-                        let payload_union = $(unionName) { $(variant.name): $(payloadValue) };
+                                let allocation_ptr = unsafe { roc_std::RocBox::leak(roc_std::RocBox::new(payload_union)) };
 
-                        let allocation_ptr = unsafe { roc_std::RocBox::leak(roc_std::RocBox::new(payload_union)) };
+                                let tagged_ptr = (allocation_ptr as usize) | ($(discriminantName)::$(variant.name) as usize);
 
-                        let tagged_ptr = (allocation_ptr as usize) | ($(discriminantName)::$(variant.name) as usize);
+                                Self { tagged_ptr }
+                            }
 
-                        Self { tagged_ptr }
-                    }
+                            pub fn $(variant.name)($(argList)) -> Self {
+                                Self::$(variant.name)_from_payload_struct($(struct)($(initList)))
+                            }
+                            """
+                        
+                        Heap { allocName } ->
+                            """
+                            pub fn $(variant.name)_from_payload_struct(payload: $(struct)) -> Self {
+                                let tagged_union = $(allocName) {
+                                    discriminant: $(discriminantName)::$(variant.name),
+                                    payload: $(unionName) { $(variant.name): $(payloadValue) },
+                                };
 
-                    pub fn $(variant.name)($(argList)) -> Self {
-                        Self::$(variant.name)_from_payload_struct($(struct)($(initList)))
-                    }
-                    """
+                                let ptr = unsafe { roc_std::RocBox::leak(roc_std::RocBox::new(tagged_union)) };
+
+                                Self { ptr }
+                            }
+
+                            pub fn $(variant.name)($(argList)) -> Self {
+                                Self::$(variant.name)_from_payload_struct($(struct)($(initList)))
+                            }
+                            """
+
 
         concatCode variantCheck constructor
 
@@ -1135,8 +1210,8 @@ recursiveTaggedConstructors = \{ name, variants, discriminantName, unionName } -
     }
     """
 
-recursiveTaggedDebugImpl : RecursiveTagged -> Code
-recursiveTaggedDebugImpl = \{ name, discriminantName, variants } ->
+recursiveDebugImpl : Recursive -> Code
+recursiveDebugImpl = \{ name, discriminantName, variants } ->
     matchArms =
         variants
         |> List.map \variant ->
@@ -1185,8 +1260,8 @@ recursiveTaggedDebugImpl = \{ name, discriminantName, variants } ->
     }
     """
 
-recursiveTaggedRefcountingImpl : RecursiveTagged -> Code
-recursiveTaggedRefcountingImpl = \{ name, discriminantName, variants, traits } ->
+recursiveRefcountingImpl : Recursive -> Code
+recursiveRefcountingImpl = \{ name, discriminantName, variants, traits } ->
     if Set.contains traits Copy then
         """
         roc_refcounted_noop_impl!($(name));
@@ -1229,14 +1304,9 @@ recursiveTaggedRefcountingImpl = \{ name, discriminantName, variants, traits } -
         }
         """
 
-recursiveTaggedDummyUnionRefcountImpl : RecursiveTagged -> Str
-recursiveTaggedDummyUnionRefcountImpl = \{ name } ->
+dummyRefcountImpl : RustSymbol -> Code
+dummyRefcountImpl = \name ->
     """
-    // we're using a leaked RocBox allocation to store this union,
-    // and RocBox requires RocRefcounted to be implemented on its child type.
-    // however, since refcounting is handled through the `$(name)` type, these functions
-    // will never actually be called, so they can be left blank.
-    // TODO: is there a way to avoid this dummy implementation?
     impl roc_std::RocRefcounted for $(name) {
         fn inc(&mut self) { unimplemented!(); }
         fn dec(&mut self) { unimplemented!(); }
@@ -1244,8 +1314,8 @@ recursiveTaggedDummyUnionRefcountImpl = \{ name } ->
     }
     """
 
-recursiveTaggedCloneImpl : RecursiveTagged -> Result Code [NotApplicable]
-recursiveTaggedCloneImpl = \{ name, discriminantName, variants, traits } ->
+recursiveCloneImpl : Recursive -> Result Code [NotApplicable]
+recursiveCloneImpl = \{ name, discriminantName, variants, traits } ->
     if Set.contains traits Clone then
         matchArms =
             variants
@@ -1287,8 +1357,8 @@ recursiveTaggedCloneImpl = \{ name, discriminantName, variants, traits } ->
     else
         Err NotApplicable
 
-recursiveTaggedDropImpl : RecursiveTagged -> Result Code [NotApplicable]
-recursiveTaggedDropImpl = \{ name, variants, discriminantName, traits } ->
+recursiveDropImpl : Recursive -> Result Code [NotApplicable]
+recursiveDropImpl = \{ name, variants, discriminantName, traits } ->
     if Set.contains traits Copy then
         Err NotApplicable
     else
@@ -1300,7 +1370,7 @@ recursiveTaggedDropImpl = \{ name, variants, discriminantName, traits } ->
                 else
                     """
                     $(discriminantName)::$(variant.name) => unsafe {
-                        core::mem::ManuallyDrop::drop(self.union_ptr()).$(variant.name));
+                        core::mem::ManuallyDrop::drop(&mut (*self.union_ptr()).$(variant.name));
                     },
                     """
             |> Str.joinWith "\n"
@@ -1317,8 +1387,8 @@ recursiveTaggedDropImpl = \{ name, variants, discriminantName, traits } ->
         """
         |> Ok
 
-recursiveTaggedOrderingImpl : RecursiveTagged -> Result Code [NotApplicable]
-recursiveTaggedOrderingImpl = \{ name, discriminantName, variants, traits } ->
+recursiveOrderingImpl : Recursive -> Result Code [NotApplicable]
+recursiveOrderingImpl = \{ name, discriminantName, variants, traits } ->
     if Set.contains traits Ord then
         matchArms =
             variants
@@ -1378,8 +1448,8 @@ recursiveTaggedOrderingImpl = \{ name, discriminantName, variants, traits } ->
     else
         Err NotApplicable
 
-recursiveTaggedEqualityImpl : RecursiveTagged -> Result Code [NotApplicable]
-recursiveTaggedEqualityImpl = \{ name, variants, discriminantName, traits } ->
+recursiveEqualityImpl : Recursive -> Result Code [NotApplicable]
+recursiveEqualityImpl = \{ name, variants, discriminantName, traits } ->
     if Set.contains traits PartialEq then
         matchArms =
             variants
@@ -1412,8 +1482,8 @@ recursiveTaggedEqualityImpl = \{ name, variants, discriminantName, traits } ->
     else
         Err NotApplicable
 
-recursiveTaggedHashImpl : RecursiveTagged -> Result Code [NotApplicable]
-recursiveTaggedHashImpl = \{ name, traits, variants, discriminantName } ->
+recursiveHashImpl : Recursive -> Result Code [NotApplicable]
+recursiveHashImpl = \{ name, traits, variants, discriminantName } ->
     if Set.contains traits Hash then
         matchArms =
             variants
@@ -1896,7 +1966,11 @@ nonRecursiveDropImpl = \{ name, variants, discriminant, traits } ->
                 if variant.isCopy then
                     "$(discriminant.name)::$(variant.name) => {},"
                 else
-                    "$(discriminant.name)::$(variant.name) => unsafe { core::mem::ManuallyDrop::drop(&mut self.payload.$(variant.name)); },"
+                    """
+                    $(discriminant.name)::$(variant.name) => unsafe {
+                        core::mem::ManuallyDrop::drop(&mut self.payload.$(variant.name));
+                    },
+                    """
             |> Str.joinWith "\n"
 
         """

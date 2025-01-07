@@ -142,6 +142,12 @@ mod glue_cli_tests {
         rust_advanced_recursive_union:"rust/advanced-recursive-union" => indoc!(r#"
             rbt was: Rbt { default: Job::Job(R1 { command: Command::Command(R2 { tool: Tool::SystemTool(R4 { name: "test", num: 42 }) }), inputFiles: ["foo"] }) }
         "#),
+        rust_untagged_recursive_union:"rust/untagged-recursive-union" => indoc!(r#"
+            tag_union was: Expr::Concat(Expr::String("Hello, "), Expr::String("World!"))
+            `Concat (String "Hello, ") (String "World!")` is: Expr::Concat(Expr::String("Hello, "), Expr::String("World!"))
+            `String "this is a test"` is: Expr::String("this is a test")
+            `Tag9 is: Expr::Tag9(42)
+        "#),
         rust_list_recursive_union:"rust/list-recursive-union" => indoc!(r#"
             rbt was: Rbt { default: Job::Job(R1 { command: Command::Command(R2 { args: [], tool: Tool::SystemTool(R3 { name: "test" }) }), inputFiles: ["foo"], job: [] }) }
         "#),
