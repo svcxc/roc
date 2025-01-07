@@ -219,8 +219,8 @@ supportedTraits = \types, type ->
 is64Bit : Architecture -> Bool
 is64Bit = \arch ->
     when arch is
-        Aarch32 | Wasm32 | X86x32 -> Bool.true
-        Aarch64 | X86x64 -> Bool.false
+        Aarch32 | Wasm32 | X86x32 -> Bool.false
+        Aarch64 | X86x64 -> Bool.true
 
 RustSymbol : Str
 RustType : Str
@@ -481,7 +481,9 @@ typeToItemGroup = \types, type ->
 
             pointerTagCapacity = if is64Bit arch then 8 else 4
 
-            discriminantStorage = 
+            dbg { arch: Inspect.toStr arch, pointerTagCapacity }
+
+            discriminantStorage =
                 if List.len tags > pointerTagCapacity then
                     Heap {
                         size: discriminantSize,
