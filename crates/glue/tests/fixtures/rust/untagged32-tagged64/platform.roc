@@ -5,6 +5,9 @@ platform "test-platform"
     imports []
     provides [mainForHost]
 
+# this tag union is eligable to store the discriminant via pointer tagging
+# on 64-bit architectures, but not on 32-bit ones. This test tests if this
+# determination is made seperately for each architecture.
 Expr : [
     String Str,
     Concat Expr Expr,
