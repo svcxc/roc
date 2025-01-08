@@ -321,6 +321,13 @@ Recursive : {
         },
         PointerTagging,
     ],
+    nullability : [
+        NonNullable,
+        Nullable {
+            nullableTagIndex : U64,
+            nullableTagName : RustSymbol,
+        },
+    ],
     variants : Variants,
     traits : Set Trait,
 }
@@ -481,8 +488,6 @@ typeToItemGroup = \types, type ->
 
             pointerTagCapacity = if is64Bit arch then 8 else 4
 
-            dbg { arch: Inspect.toStr arch, pointerTagCapacity }
-
             discriminantStorage =
                 if List.len tags > pointerTagCapacity then
                     Heap {
@@ -497,6 +502,43 @@ typeToItemGroup = \types, type ->
                 name: escape name,
                 discriminantName: "discriminant_$(name)",
                 discriminantStorage,
+                nullability: NonNullable,
+                unionName: "union_$(name)",
+                variants: tagsToVariants types tags,
+                traits: supportedTraits types type,
+            }
+            
+            Ok (TagUnion union)
+        
+        TagUnion (NullableWrapped { name, tags, discriminantSize, discriminantOffset, indexOfNullTag }) ->
+            arch = (Types.target types).architecture
+
+            pointerTagCapacity = if is64Bit arch then 8 else 4
+
+            discriminantStorage =
+                if List.len tags > pointerTagCapacity then
+                    Heap {
+                        size: discriminantSize,
+                        offset: discriminantOffset,
+                        allocName: "allocation_$(name)",
+                    }
+                else
+                    PointerTagging
+            
+            nullableTagIndex = Num.intCast indexOfNullTag
+
+            nullableTagName = when List.get tags nullableTagIndex is
+                Ok tag -> tag.name
+                Err _ -> crash "this is a bug in the glue platform!"
+
+            union = Recursive {
+                name: escape name,
+                discriminantName: "discriminant_$(name)",
+                discriminantStorage,
+                nullability: Nullable {
+                    nullableTagIndex,
+                    nullableTagName,
+                },
                 unionName: "union_$(name)",
                 variants: tagsToVariants types tags,
                 traits: supportedTraits types type,
@@ -979,7 +1021,7 @@ singleTagStruct = \{ name, tagName, fields, derives } ->
 
 recursive : Recursive -> Code
 recursive = \info ->
-    { name, variants, unionName, discriminantName, discriminantStorage } = info
+    { name, variants, unionName, discriminantName, discriminantStorage, nullability } = info
 
     variantNames =
         variants
@@ -1004,12 +1046,22 @@ recursive = \info ->
             else
                 "$(variant.name): core::mem::ManuallyDrop<$(payload)>,"
         |> Str.joinWith "\n"
-    
+
     common =
         when discriminantStorage is
             PointerTagging ->
                 pointerTagMask = if List.len variants > 4 then "0b111usize" else "0b11usize"
 
+                nullCheck =
+                    when nullability is
+                        NonNullable -> "debug_assert_neq!(self.tagged_ptr, 0);"
+                        Nullable { nullableTagName } ->
+                            """
+                            if self.tagged_ptr == 0 {
+                                return $(discriminantName)::$(nullableTagName);
+                            }
+                            """
+                
                 """
                 #[repr(transparent)]
                 pub struct $(name) {
@@ -1036,10 +1088,12 @@ recursive = \info ->
                             [$(variantNames)]
                         };
 
+                        $(nullCheck |> indentedBy 2)
+
                         discriminants[self.tagged_ptr & $(pointerTagMask)]
                     }
 
-                    pub fn union_ptr(&self) -> *mut $(unionName) {
+                    fn union_ptr(&self) -> *mut $(unionName) {
                         (self.tagged_ptr & !$(pointerTagMask)) as *mut _
                     }
                 }
@@ -1053,6 +1107,16 @@ recursive = \info ->
                 """
             
             Heap { allocName } ->
+                nullCheck =
+                    when nullability is
+                        NonNullable -> "debug_assert_neq!(self.tagged_ptr, 0);"
+                        Nullable { nullableTagName } ->
+                            """
+                            if self.tagged_ptr == 0 {
+                                return $(discriminantName)::$(nullableTagName);
+                            }
+                            """
+            
                 """
                 #[repr(transparent)]
                 pub struct $(name) {
@@ -1078,10 +1142,12 @@ recursive = \info ->
 
                 impl $(name) {
                     pub fn discriminant(&self) -> $(discriminantName) {
+                        $(nullCheck)
+
                         unsafe { (*self.ptr).discriminant }
                     }
 
-                    pub fn union_ptr(&self) -> *mut $(unionName) {
+                    fn union_ptr(&self) -> *mut $(unionName) {
                         unsafe { &mut (*self.ptr).payload }
                     }
                 }
@@ -1107,8 +1173,8 @@ recursive = \info ->
     |> appendIfOk (recursiveHashImpl info)
 
 recursiveConstructors : Recursive -> Code
-recursiveConstructors = \{ name, variants, discriminantName, discriminantStorage, unionName } ->
-    variantMethods = \variant ->
+recursiveConstructors = \{ name, variants, discriminantName, discriminantStorage, nullability, unionName } ->
+    variantMethods = \variant, variantIndex ->
         variantCheck =
             """
             pub fn is_$(variant.name)(&self) -> bool {
@@ -1120,90 +1186,170 @@ recursiveConstructors = \{ name, variants, discriminantName, discriminantStorage
             payloadValue =
                 if variant.isCopy then "payload" else "core::mem::ManuallyDrop::new(payload)"
             
-            when variant.payload is
-                None -> crash "this kind of tag union should have payloads on every tag"
-                Single type ->
-                    when discriminantStorage is
-                        PointerTagging ->
-                            """
-                            pub fn $(variant.name)(payload: $(type)) -> Self {
-                                let payload_union = $(unionName) { $(variant.name): $(payloadValue) };
+            constructorInfo = {
+                payload: variant.payload,
+                discriminantStorage,
+            }
 
-                                let allocation_ptr = unsafe { roc_std::RocBox::leak(roc_std::RocBox::new(payload_union)) };
+            variantRepresentedByNull =
+                when nullability is
+                    Nullable { nullableTagIndex } -> nullableTagIndex == variantIndex
+                    _ -> Bool.false
 
-                                let tagged_ptr = (allocation_ptr as usize) | ($(discriminantName)::$(variant.name) as usize);
+            if variantRepresentedByNull then
+                # these could be constants, just like 
+                when discriminantStorage is
+                    PointerTagging ->
+                        """
+                        pub const fn $(variant.name)() -> Self {
+                            Self { tagged_ptr: 0 }
+                        }
+                        """
 
-                                Self { tagged_ptr }
-                            }
-                            """
-                        
-                        Heap { allocName } ->
-                            """
-                            pub fn $(variant.name)(payload: $(type)) -> Self {
-                                let tagged_union = $(allocName) {
-                                    discriminant: $(discriminantName)::$(variant.name),
-                                    payload: $(unionName) { $(variant.name): $(payloadValue) },
-                                };
+                    Heap _ ->
+                        """
+                        pub const fn $(variant.name)() -> Self {
+                            Self { ptr: core::ptr::null_mut() }
+                        }
+                        """
+            else
+                when constructorInfo is
+                    # # TODO: replace the above if-expression with the below clauses for readability
+                    # # once exhaustiveness checking around if-guards works correctly
 
-                                let ptr = unsafe { roc_std::RocBox::leak(roc_std::RocBox::new(tagged_union)) };
+                    # { payload: _, discriminantStorage: PointerTagging } if variantRepresentedByNull ->
+                    #     """
+                    #     pub const fn $(variant.name)() -> Self {
+                    #         Self { tagged_ptr: 0 }
+                    #     }
+                    #     """
+                    
+                    # { payload: _, discriminantStorage: Heap _ } if variantRepresentedByNull ->
+                    #     """
+                    #     pub const fn $(variant.name)() -> Self {
+                    #         Self { ptr: core::ptr::null_mut() }
+                    #     }
+                    #     """
 
-                                Self { ptr }
-                            }
-                            """
+                    { payload: None, discriminantStorage: PointerTagging } ->
+                        """
+                        pub fn $(variant.name)() -> Self {
+                            // TODO: this code just moves uninitialized bytes from the stack to the heap.
+                            // slightly better solution would be to have a RocBox::new_uninit() function,
+                            // an ideal solution would be not having to leak a RocBox to allocate at all.
+                            // best look into how to best do the latter sometime.
+                            let payload_union = core::mem::MaybeUninit::<$(unionName)>::uninit();
 
-                Multiple { struct, types } ->
-                    argList =
-                        types
-                        |> List.mapWithIndex \type, i -> "p$(Num.toStr i): $(type)"
-                        |> Str.joinWith ", "
+                            let allocation_ptr = unsafe { roc_std::RocBox::leak(roc_std::RocBox::new(payload_union)) };
 
-                    initList =
-                        types
-                        |> List.mapWithIndex \_, i -> "p$(Num.toStr i)"
-                        |> Str.joinWith ", "
+                            let tagged_ptr = (allocation_ptr as usize) | ($(discriminantName)::$(variant.name) as usize);
 
-                    when discriminantStorage is
-                        PointerTagging ->
-                            """
-                            pub fn $(variant.name)_from_payload_struct(payload: $(struct)) -> Self {
-                                let payload_union = $(unionName) { $(variant.name): $(payloadValue) };
+                            Self { tagged_ptr }
+                        }
+                        """
 
-                                let allocation_ptr = unsafe { roc_std::RocBox::leak(roc_std::RocBox::new(payload_union)) };
+                    { payload: None, discriminantStorage: Heap { allocName } } ->
+                        """
+                        pub fn $(variant.name)() -> Self {
+                            let tagged_union = $(allocName) {
+                                discriminant: $(discriminantName)::$(variant.name),
+                                payload: core::mem::MaybeUninit::<$(unionName)>::uninit().assume_init(),
+                            };
 
-                                let tagged_ptr = (allocation_ptr as usize) | ($(discriminantName)::$(variant.name) as usize);
+                            let ptr = unsafe { roc_std::RocBox::leak(roc_std::RocBox::new(tagged_union)) };
 
-                                Self { tagged_ptr }
-                            }
+                            Self { ptr }
+                        }
+                        """
+                    
+                    { payload: Single type, discriminantStorage: PointerTagging } ->
+                        """
+                        pub fn $(variant.name)(payload: $(type)) -> Self {
+                            let payload_union = $(unionName) { $(variant.name): $(payloadValue) };
 
-                            pub fn $(variant.name)($(argList)) -> Self {
-                                Self::$(variant.name)_from_payload_struct($(struct)($(initList)))
-                            }
-                            """
-                        
-                        Heap { allocName } ->
-                            """
-                            pub fn $(variant.name)_from_payload_struct(payload: $(struct)) -> Self {
-                                let tagged_union = $(allocName) {
-                                    discriminant: $(discriminantName)::$(variant.name),
-                                    payload: $(unionName) { $(variant.name): $(payloadValue) },
-                                };
+                            let allocation_ptr = unsafe { roc_std::RocBox::leak(roc_std::RocBox::new(payload_union)) };
 
-                                let ptr = unsafe { roc_std::RocBox::leak(roc_std::RocBox::new(tagged_union)) };
+                            let tagged_ptr = (allocation_ptr as usize) | ($(discriminantName)::$(variant.name) as usize);
 
-                                Self { ptr }
-                            }
+                            Self { tagged_ptr }
+                        }
+                        """
 
-                            pub fn $(variant.name)($(argList)) -> Self {
-                                Self::$(variant.name)_from_payload_struct($(struct)($(initList)))
-                            }
-                            """
+                    { payload: Single type, discriminantStorage: Heap { allocName }} ->
+                        """
+                        pub fn $(variant.name)(payload: $(type)) -> Self {
+                            let tagged_union = $(allocName) {
+                                discriminant: $(discriminantName)::$(variant.name),
+                                payload: $(unionName) { $(variant.name): $(payloadValue) },
+                            };
 
+                            let ptr = unsafe { roc_std::RocBox::leak(roc_std::RocBox::new(tagged_union)) };
+
+                            Self { ptr }
+                        }
+                        """
+
+                    { payload: Multiple { struct, types }, discriminantStorage: PointerTagging } ->
+                        argList =
+                            types
+                            |> List.mapWithIndex \type, i -> "p$(Num.toStr i): $(type)"
+                            |> Str.joinWith ", "
+
+                        initList =
+                            types
+                            |> List.mapWithIndex \_, i -> "p$(Num.toStr i)"
+                            |> Str.joinWith ", "
+
+                        """
+                        pub fn $(variant.name)_from_payload_struct(payload: $(struct)) -> Self {
+                            let payload_union = $(unionName) { $(variant.name): $(payloadValue) };
+
+                            let allocation_ptr = unsafe { roc_std::RocBox::leak(roc_std::RocBox::new(payload_union)) };
+
+                            let tagged_ptr = (allocation_ptr as usize) | ($(discriminantName)::$(variant.name) as usize);
+
+                            Self { tagged_ptr }
+                        }
+
+                        pub fn $(variant.name)($(argList)) -> Self {
+                            Self::$(variant.name)_from_payload_struct($(struct)($(initList)))
+                        }
+                        """
+                    
+                    { payload: Multiple { struct, types }, discriminantStorage: Heap { allocName } } ->
+
+                        argList =
+                            types
+                            |> List.mapWithIndex \type, i -> "p$(Num.toStr i): $(type)"
+                            |> Str.joinWith ", "
+
+                        initList =
+                            types
+                            |> List.mapWithIndex \_, i -> "p$(Num.toStr i)"
+                            |> Str.joinWith ", "
+
+                        """
+                        pub fn $(variant.name)_from_payload_struct(payload: $(struct)) -> Self {
+                            let tagged_union = $(allocName) {
+                                discriminant: $(discriminantName)::$(variant.name),
+                                payload: $(unionName) { $(variant.name): $(payloadValue) },
+                            };
+
+                            let ptr = unsafe { roc_std::RocBox::leak(roc_std::RocBox::new(tagged_union)) };
+
+                            Self { ptr }
+                        }
+
+                        pub fn $(variant.name)($(argList)) -> Self {
+                            Self::$(variant.name)_from_payload_struct($(struct)($(initList)))
+                        }
+                        """
 
         concatCode variantCheck constructor
 
     methods =
         variants
-        |> List.map variantMethods
+        |> List.mapWithIndex variantMethods
         |> Str.joinWith "\n\n"
 
     """
@@ -1322,26 +1468,32 @@ recursiveCloneImpl = \{ name, discriminantName, variants, traits } ->
         matchArms =
             variants
             |> List.map \variant ->
-                constructorName =
-                    # at time of writing, removing this indirection causes the roc compiler to crash on build.
-                    # TODO: make a minimal reproduction, if it still exists
-                    payload = variant.payload
-                    when payload is
-                        Multiple _ -> "Self::$(variant.name)_from_payload_struct"
-                        _ -> "Self::$(variant.name)"
+                if variant.payload == None then
+                    """
+                    $(discriminantName)::$(variant.name) =>
+                        Self::$(variant.name)(),
+                    """
+                else
+                    constructorName =
+                        # at time of writing, removing this indirection causes the roc compiler to crash on build.
+                        # TODO: make a minimal reproduction, if it still exists
+                        payload = variant.payload
+                        when payload is
+                            Multiple _ -> "Self::$(variant.name)_from_payload_struct"
+                            _ -> "Self::$(variant.name)"
 
-                clonedPayload =
-                    if variant.isCopy then
-                        "(*self.union_ptr()).$(variant.name)"
-                    else
-                        "(*(*self.union_ptr()).$(variant.name)).clone()"
-
-                """
-                $(discriminantName)::$(variant.name) =>
-                    $(constructorName)(
-                        $(clonedPayload)
-                    ),
-                """
+                    clonedPayload =
+                        if variant.isCopy then
+                            "(*self.union_ptr()).$(variant.name)"
+                        else
+                            "(*(*self.union_ptr()).$(variant.name)).clone()"
+                    
+                    """
+                    $(discriminantName)::$(variant.name) =>
+                        $(constructorName)(
+                            $(clonedPayload)
+                        ),
+                    """
             |> Str.joinWith "\n\n"
 
         """
@@ -1596,7 +1748,7 @@ nonRecursiveVariantMethods = \{ name, variants, discriminant, union } ->
             when variant.payload is
                 None ->
                     """
-                    pub fn $(variant.name)() -> Self {
+                    pub const fn $(variant.name)() -> Self {
                         Self {
                             discriminant: $(discriminant.name)::$(variant.name),
                             payload: $(union.name) {
@@ -1611,7 +1763,7 @@ nonRecursiveVariantMethods = \{ name, variants, discriminant, union } ->
                         if variant.isCopy then "payload" else "core::mem::ManuallyDrop::new(payload)"
 
                     """
-                    pub fn $(variant.name)(payload: $(type)) -> Self {
+                    pub const fn $(variant.name)(payload: $(type)) -> Self {
                         Self {
                             discriminant: $(discriminant.name)::$(variant.name),
                             payload: $(union.name) {
@@ -1639,7 +1791,7 @@ nonRecursiveVariantMethods = \{ name, variants, discriminant, union } ->
                             "core::mem::ManuallyDrop::new($(struct)($(initList)))"
 
                     """
-                    pub fn $(variant.name)($(argList)) -> Self {
+                    pub const fn $(variant.name)($(argList)) -> Self {
                         Self {
                             discriminant: $(discriminant.name)::$(variant.name),
                             payload: $(union.name) {
