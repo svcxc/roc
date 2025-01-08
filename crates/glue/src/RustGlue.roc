@@ -321,16 +321,18 @@ Recursive : {
         },
         PointerTagging,
     ],
-    nullability : [
-        NonNullable,
-        Nullable {
-            nullableTagIndex : U64,
-            nullableTagName : RustSymbol,
-        },
-    ],
+    nullability : Nullability,
     variants : Variants,
     traits : Set Trait,
 }
+
+Nullability : [
+    NonNullable,
+    Nullable {
+        nullableTagIndex : U64,
+        nullableTagName : RustSymbol,
+    },
+]
 
 entrypoints : Types -> List ItemGroup
 entrypoints = \types ->
@@ -352,6 +354,12 @@ entrypoints = \types ->
 
                 _ -> ([], rustTypeName types type)
         Entrypoint { name, number: number + 1, args, ret }
+
+variantIsNull : Nullability, U64 -> Bool
+variantIsNull = \nullability, variantIndex ->
+    when nullability is
+        Nullable { nullableTagIndex } -> nullableTagIndex == variantIndex
+        NonNullable -> Bool.false
 
 tagsToVariants : Types, Tags -> Variants
 tagsToVariants = \types, tags ->
@@ -1054,7 +1062,7 @@ recursive = \info ->
 
                 nullCheck =
                     when nullability is
-                        NonNullable -> "debug_assert_neq!(self.tagged_ptr, 0);"
+                        NonNullable -> "debug_assert_ne!(self.tagged_ptr, 0);"
                         Nullable { nullableTagName } ->
                             """
                             if self.tagged_ptr == 0 {
@@ -1093,7 +1101,14 @@ recursive = \info ->
                         discriminants[self.tagged_ptr & $(pointerTagMask)]
                     }
 
+                    #[track_caller]
                     fn union_ptr(&self) -> *mut $(unionName) {
+                        // this will only ever be a null pointer when the union holds a zero-sized type.
+                        // dereferencing a null pointer to a ZST doesn't crash at time of writing,
+                        // but is undefined behavior according to the Rustonomicon, so it should be avoided.
+                        // https://doc.rust-lang.org/nomicon/exotic-sizes.html#zero-sized-types-zsts:~:text=Dereferencing%20a%20null%20or%20unaligned%20pointer%20to%20a%20ZST%20is%20undefined%20behavior%2C%20just%20like%20for%20any%20other%20type.
+                        debug_assert_ne!(self.tagged_ptr, 0, "`{}` called `$(name)::union_ptr()` when the union pointer was null", core::panic::Location::caller());
+
                         (self.tagged_ptr & !$(pointerTagMask)) as *mut _
                     }
                 }
@@ -1109,10 +1124,10 @@ recursive = \info ->
             Heap { allocName } ->
                 nullCheck =
                     when nullability is
-                        NonNullable -> "debug_assert_neq!(self.tagged_ptr, 0);"
+                        NonNullable -> "debug_assert!(!self.ptr.is_null());"
                         Nullable { nullableTagName } ->
                             """
-                            if self.tagged_ptr == 0 {
+                            if self.ptr.is_null() {
                                 return $(discriminantName)::$(nullableTagName);
                             }
                             """
@@ -1148,6 +1163,12 @@ recursive = \info ->
                     }
 
                     fn union_ptr(&self) -> *mut $(unionName) {
+                        // this will only ever be a null pointer when the union holds a zero-sized type.
+                        // dereferencing a null pointer to a ZST doesn't crash at time of writing,
+                        // but is undefined behavior according to the Rustonomicon, so it should be avoided.
+                        // https://doc.rust-lang.org/nomicon/exotic-sizes.html#zero-sized-types-zsts:~:text=Dereferencing%20a%20null%20or%20unaligned%20pointer%20to%20a%20ZST%20is%20undefined%20behavior%2C%20just%20like%20for%20any%20other%20type.
+                        debug_assert!(!self.ptr.is_null());
+
                         unsafe { &mut (*self.ptr).payload }
                     }
                 }
@@ -1191,12 +1212,7 @@ recursiveConstructors = \{ name, variants, discriminantName, discriminantStorage
                 discriminantStorage,
             }
 
-            variantRepresentedByNull =
-                when nullability is
-                    Nullable { nullableTagIndex } -> nullableTagIndex == variantIndex
-                    _ -> Bool.false
-
-            if variantRepresentedByNull then
+            if variantIsNull nullability variantIndex then
                 # these could be constants, just like 
                 when discriminantStorage is
                     PointerTagging ->
@@ -1359,11 +1375,24 @@ recursiveConstructors = \{ name, variants, discriminantName, discriminantStorage
     """
 
 recursiveDebugImpl : Recursive -> Code
-recursiveDebugImpl = \{ name, discriminantName, variants } ->
+recursiveDebugImpl = \{ name, discriminantName, variants, nullability } ->
     matchArms =
         variants
-        |> List.map \variant ->
-            when variant.payload is
+        |> List.mapWithIndex \variant, variantIndex ->
+            if variant.payload != None && variantIsNull nullability variantIndex then
+                """
+                $(discriminantName)::$(variant.name) =>
+                    // if this comment appears, it means the roc compiler has learned to treat zero-sized types
+                    // as potentially nullable in a NullableWrapped tag union.
+                    //
+                    // at the time of writing this version of RustGlue.roc, this is optimization is not performed,
+                    // but it might in the future. see this as a patch-fix to a problem that doesn't exist yet!
+                    //
+                    // this code will not print the zero-sized payload this tag contains, but as it's zero-sized
+                    // anyway, that shouldn't really matter besides being a bit surprising.
+                    f.write_str("$(name)::$(variant.name)( /* cant print this: see RustGlue.roc for details */ )"),
+                """
+            else when variant.payload is
                 None ->
                     """
                     $(discriminantName)::$(variant.name) =>
@@ -1409,7 +1438,7 @@ recursiveDebugImpl = \{ name, discriminantName, variants } ->
     """
 
 recursiveRefcountingImpl : Recursive -> Code
-recursiveRefcountingImpl = \{ name, discriminantName, variants, traits } ->
+recursiveRefcountingImpl = \{ name, discriminantName, variants, traits, nullability } ->
     if Set.contains traits Copy then
         """
         roc_refcounted_noop_impl!($(name));
@@ -1417,8 +1446,11 @@ recursiveRefcountingImpl = \{ name, discriminantName, variants, traits } ->
     else
         matchArms = \incOrDec ->
             variants
-            |> List.map \variant ->
-                if variant.isCopy then
+            |> List.mapWithIndex \variant, variantIndex ->
+                payload = variant.payload
+                if payload == None || variantIsNull nullability variantIndex then
+                    "$(discriminantName)::$(variant.name) => {}"
+                else if variant.isCopy then
                     """
                     $(discriminantName)::$(variant.name) =>
                         (*self.union_ptr()).$(variant.name).$(incOrDec)(),
@@ -1463,37 +1495,32 @@ dummyRefcountImpl = \name ->
     """
 
 recursiveCloneImpl : Recursive -> Result Code [NotApplicable]
-recursiveCloneImpl = \{ name, discriminantName, variants, traits } ->
+recursiveCloneImpl = \{ name, discriminantName, variants, traits, nullability } ->
     if Set.contains traits Clone then
         matchArms =
             variants
-            |> List.map \variant ->
-                if variant.payload == None then
-                    """
-                    $(discriminantName)::$(variant.name) =>
-                        Self::$(variant.name)(),
-                    """
-                else
-                    constructorName =
-                        # at time of writing, removing this indirection causes the roc compiler to crash on build.
-                        # TODO: make a minimal reproduction, if it still exists
-                        payload = variant.payload
-                        when payload is
-                            Multiple _ -> "Self::$(variant.name)_from_payload_struct"
-                            _ -> "Self::$(variant.name)"
+            |> List.mapWithIndex \variant, variantIndex ->
+                constructorName =
+                    # at time of writing, removing this indirection causes the roc compiler to crash on build.
+                    # TODO: make a minimal reproduction, if it still exists
+                    payload = variant.payload
+                    when payload is
+                        Multiple _ -> "Self::$(variant.name)_from_payload_struct"
+                        _ -> "Self::$(variant.name)"
 
-                    clonedPayload =
-                        if variant.isCopy then
-                            "(*self.union_ptr()).$(variant.name)"
-                        else
-                            "(*(*self.union_ptr()).$(variant.name)).clone()"
-                    
-                    """
-                    $(discriminantName)::$(variant.name) =>
-                        $(constructorName)(
-                            $(clonedPayload)
-                        ),
-                    """
+                clonedPayload =
+                    payload = variant.payload
+                    if payload == None || variantIsNull nullability variantIndex then
+                        ""
+                    else if variant.isCopy then
+                        "(*self.union_ptr()).$(variant.name)"
+                    else
+                        "(*(*self.union_ptr()).$(variant.name)).clone()"
+                
+                """
+                $(discriminantName)::$(variant.name) =>
+                    $(constructorName)($(clonedPayload)),
+                """
             |> Str.joinWith "\n\n"
 
         """
@@ -1512,14 +1539,14 @@ recursiveCloneImpl = \{ name, discriminantName, variants, traits } ->
         Err NotApplicable
 
 recursiveDropImpl : Recursive -> Result Code [NotApplicable]
-recursiveDropImpl = \{ name, variants, discriminantName, traits } ->
+recursiveDropImpl = \{ name, variants, discriminantName, traits, nullability } ->
     if Set.contains traits Copy then
         Err NotApplicable
     else
         matchArms =
             variants
-            |> List.map \variant ->
-                if variant.isCopy then
+            |> List.mapWithIndex \variant, variantIndex ->
+                if variant.isCopy || variantIsNull nullability variantIndex then
                     "$(discriminantName)::$(variant.name) => {},"
                 else
                     """
@@ -1542,12 +1569,19 @@ recursiveDropImpl = \{ name, variants, discriminantName, traits } ->
         |> Ok
 
 recursiveOrderingImpl : Recursive -> Result Code [NotApplicable]
-recursiveOrderingImpl = \{ name, discriminantName, variants, traits } ->
+recursiveOrderingImpl = \{ name, discriminantName, variants, traits, nullability } ->
     if Set.contains traits Ord then
         matchArms =
             variants
-            |> List.map \variant ->
-                "$(discriminantName)::$(variant.name) => (*self.union_ptr()).$(variant.name).cmp(&(*other.union_ptr()).$(variant.name)),"
+            |> List.mapWithIndex \variant, variantIndex ->
+                payload = variant.payload
+                if payload == None || variantIsNull nullability variantIndex then
+                    "$(discriminantName)::$(variant.name) => core::cmp::Ordering::Equal,"
+                else
+                    """
+                    $(discriminantName)::$(variant.name) =>
+                        (*self.union_ptr()).$(variant.name).cmp(&(*other.union_ptr()).$(variant.name)),
+                    """
             |> Str.joinWith "\n"
 
         """
@@ -1577,8 +1611,15 @@ recursiveOrderingImpl = \{ name, discriminantName, variants, traits } ->
     else if Set.contains traits PartialOrd then
         matchArms =
             variants
-            |> List.map \variant ->
-                "$(discriminantName)::$(variant.name) => (*self.union_ptr()).$(variant.name).partial_cmp(&(*other.union_ptr()).$(variant.name)),"
+            |> List.mapWithIndex \variant, variantIndex ->
+                payload = variant.payload
+                if payload == None || variantIsNull nullability variantIndex then
+                    "$(discriminantName)::$(variant.name) => core::cmp::Ordering::Equal,"
+                else
+                    """
+                    $(discriminantName)::$(variant.name) =>
+                        (*self.union_ptr()).$(variant.name).partial_cmp(&(*other.union_ptr()).$(variant.name)),
+                    """
             |> Str.joinWith "\n"
 
         """
@@ -1603,13 +1644,20 @@ recursiveOrderingImpl = \{ name, discriminantName, variants, traits } ->
         Err NotApplicable
 
 recursiveEqualityImpl : Recursive -> Result Code [NotApplicable]
-recursiveEqualityImpl = \{ name, variants, discriminantName, traits } ->
+recursiveEqualityImpl = \{ name, variants, discriminantName, traits, nullability } ->
     if Set.contains traits PartialEq then
         matchArms =
             variants
-            |> List.map \variant ->
-                "$(discriminantName)::$(variant.name) => (*self.union_ptr()).$(variant.name) == (*other.union_ptr()).$(variant.name),"
-            |> Str.joinWith "\n"
+            |> List.mapWithIndex \variant, variantIndex ->
+                payload = variant.payload
+                if payload == None || variantIsNull nullability variantIndex then
+                    "$(discriminantName)::$(variant.name) => true,"
+                else
+                    """
+                    $(discriminantName)::$(variant.name) =>
+                        (*self.union_ptr()).$(variant.name) == (*other.union_ptr()).$(variant.name),
+                    """
+            |> Str.joinWith "\n\n"
 
         partialEq =
             """
@@ -1637,17 +1685,21 @@ recursiveEqualityImpl = \{ name, variants, discriminantName, traits } ->
         Err NotApplicable
 
 recursiveHashImpl : Recursive -> Result Code [NotApplicable]
-recursiveHashImpl = \{ name, traits, variants, discriminantName } ->
+recursiveHashImpl = \{ name, traits, variants, discriminantName, nullability } ->
     if Set.contains traits Hash then
         matchArms =
             variants
-            |> List.map \variant -> "$(discriminantName)::$(variant.name) => (*self.union_ptr()).$(variant.name).hash(state),"
+            |> List.mapWithIndex \variant, variantIndex ->
+                payload = variant.payload
+                if payload == None || variantIsNull nullability variantIndex then
+                    "$(discriminantName)::$(variant.name) => {},"
+                else
+                    "$(discriminantName)::$(variant.name) => (*self.union_ptr()).$(variant.name).hash(state),"
             |> Str.joinWith "\n\n"
 
         """
         impl core::hash::Hash for $(name) {
             fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-                // TODO: this hashes the pointer, mirroring what `Box` does. Is this acceptable?
                 self.discriminant().hash(state);
 
                 unsafe {

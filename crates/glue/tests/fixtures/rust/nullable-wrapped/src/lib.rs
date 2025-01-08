@@ -33,6 +33,7 @@ pub extern "C" fn rust_main() {
 
     assert!(tag_union.partial_cmp(&tag_union) == Some(Ordering::Equal)); // PartialOrd
     assert!(tag_union.cmp(&tag_union) == Ordering::Equal); // Ord
+    assert!(StrFingerTree::Empty().cmp(&StrFingerTree::Empty()) == Ordering::Equal); // Ord
 
     print!(
         indoc!(
