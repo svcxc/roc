@@ -239,10 +239,10 @@ Trait : [
 ]
 
 # as received by the roc glue platform
-Tags : List { name : Str, payload : [Some TypeId, None] }
+Tag : { name : Str, payload : [Some TypeId, None] }
 
 # as used in Rust code generation
-Variants : List { name : RustSymbol, payload : [None, Single RustType, Multiple { struct : RustType, types : List RustType }], isCopy : Bool }
+Variant : { name : RustSymbol, payload : [None, Single RustType, Multiple { struct : RustType, types : List RustType }], isCopy : Bool }
 
 # MARK: ItemGroup
 ItemGroup : [
@@ -255,6 +255,7 @@ ItemGroup : [
             NonRecursive NonRecursive,
             SingleTagStruct SingleTagStruct,
             Recursive Recursive,
+            ConsList ConsList
         ],
 ]
 
@@ -263,6 +264,7 @@ Entrypoint : {
     number : U64,
     args : List RustType,
     ret : RustType,
+    containsConslist: Bool,
 }
 
 Record : {
@@ -298,7 +300,7 @@ NonRecursive : {
         size : U32,
         align : U32,
     },
-    variants : Variants,
+    variants : List Variant,
     traits : Set Trait,
 }
 
@@ -322,7 +324,7 @@ Recursive : {
         PointerTagging,
     ],
     nullability : Nullability,
-    variants : Variants,
+    variants : List Variant,
     traits : Set Trait,
 }
 
@@ -333,6 +335,14 @@ Nullability : [
         nullableTagName : RustSymbol,
     },
 ]
+
+ConsList : {
+    name : RustSymbol,
+    nonNullTag : RustSymbol,
+    nullTag : RustSymbol,
+    payload : RustSymbol,
+    derives : Set Trait,
+}
 
 entrypoints : Types -> List ItemGroup
 entrypoints = \types ->
@@ -353,7 +363,7 @@ entrypoints = \types ->
                     )
 
                 _ -> ([], rustTypeName types type)
-        Entrypoint { name, number: number + 1, args, ret }
+        Entrypoint { name, number: number + 1, args, ret, containsConslist: containsConslist types type }
 
 variantIsNull : Nullability, U64 -> Bool
 variantIsNull = \nullability, variantIndex ->
@@ -361,39 +371,43 @@ variantIsNull = \nullability, variantIndex ->
         Nullable { nullableTagIndex } -> nullableTagIndex == variantIndex
         NonNullable -> Bool.false
 
-tagsToVariants : Types, Tags -> Variants
+tagsToVariants : Types, List Tag -> List Variant
 tagsToVariants = \types, tags ->
     List.map tags \tag ->
-        when tag.payload is
-            None ->
-                {
-                    name: tag.name,
-                    payload: None,
-                    isCopy: Bool.true,
-                }
+        tagToVariant types tag
 
-            Some id ->
-                name = rustTypeName types id
+tagToVariant : Types, Tag -> Variant
+tagToVariant = \types, tag ->
+    when tag.payload is
+        None ->
+            {
+                name: tag.name,
+                payload: None,
+                isCopy: Bool.true,
+            }
 
-                getPayloadTypeNames = \list ->
-                    List.map list \{ id: payloadId } ->
-                        rustTypeName types payloadId
+        Some id ->
+            name = rustTypeName types id
 
-                payload =
-                    when Types.shape types id is
-                        TagUnionPayload { fields: HasNoClosure list } ->
-                            Multiple { struct: name, types: getPayloadTypeNames list }
+            getPayloadTypeNames = \list ->
+                List.map list \{ id: payloadId } ->
+                    rustTypeName types payloadId
 
-                        TagUnionPayload { fields: HasClosure list } ->
-                            Multiple { struct: name, types: getPayloadTypeNames list }
+            payload =
+                when Types.shape types id is
+                    TagUnionPayload { fields: HasNoClosure list } ->
+                        Multiple { struct: name, types: getPayloadTypeNames list }
 
-                        _ -> Single name
+                    TagUnionPayload { fields: HasClosure list } ->
+                        Multiple { struct: name, types: getPayloadTypeNames list }
 
-                {
-                    name: tag.name,
-                    payload,
-                    isCopy: supportedTraits types id |> Set.contains Copy,
-                }
+                    _ -> Single name
+
+            {
+                name: tag.name,
+                payload,
+                isCopy: supportedTraits types id |> Set.contains Copy,
+            }
 
 typesToItemGroups : Types -> List ItemGroup
 typesToItemGroups = \types ->
@@ -553,6 +567,18 @@ typeToItemGroup = \types, type ->
             }
             
             Ok (TagUnion union)
+        
+        TagUnion (NullableUnwrapped { name, nullTag, nonNullTag, whichTagIsNull: _, nonNullPayload }) ->
+            # TODO: is whichTagIsNull actually important for anything?
+            union = ConsList {
+                name: escape name,
+                nullTag,
+                nonNullTag,
+                payload: rustTypeName types nonNullPayload,
+                derives: supportedTraits types nonNullPayload,
+            }
+            
+            Ok (TagUnion union)
 
         Function { isToplevel } if isToplevel ->
             # taken care of by `entrypoints`
@@ -694,6 +720,28 @@ rustTypeName = \types, type ->
         Unsized -> crash "what"
         RocDict _ _ | RocSet _ -> crash "todo"
 
+containsConslist : Types, TypeId -> RustType
+containsConslist = \types, type ->
+    helper = \id -> containsConslist types id
+
+    when Types.shape types type is
+        RocStr | Bool | Num _ | Unit | TagUnion (Enumeration _) -> Bool.false
+        RocResult a b -> helper a || helper b
+        RocList a | RocBox a -> helper a
+        # TagUnion (NonRecursive { name }) -> escape name
+        # TagUnion (Recursive { name }) -> escape name
+        # TagUnion (NullableWrapped { name }) -> escape name
+        # TagUnion (NonNullableUnwrapped { name }) -> escape name
+        # TagUnion (SingleTagStruct { name }) -> escape name
+        # TagUnion (NullableUnwrapped { name }) -> escape name
+        EmptyTagUnion -> crash "should never happen"
+        # Struct { name } -> escape name
+        # Function { functionName } -> escape functionName
+        # TagUnionPayload { name } -> escape name
+        RecursivePointer _ -> Bool.false
+        Unsized -> crash "what"
+        RocDict _ _ | RocSet _ -> crash "todo"
+
 ## indents all lines except the first so multiline substitions play nice in string interpolation
 ## e.g:
 ## """
@@ -762,9 +810,12 @@ generateItemGroup = \itemGroup ->
 
         TagUnion (Recursive info) ->
             recursive info
+        
+        TagUnion (ConsList info) ->
+            consList info
 
 entrypoint : Entrypoint -> Code
-entrypoint = \{ name, number, args, ret } ->
+entrypoint = \{ name, number, args, ret, containsConslist } ->
     defArgs =
         args
         |> List.mapWithIndex \type, n -> "arg$(Num.toStr n): $(type)"
@@ -775,21 +826,28 @@ entrypoint = \{ name, number, args, ret } ->
         |> List.mapWithIndex \_, n -> "arg$(Num.toStr n)"
         |> Str.joinWith ", "
 
-    """
-    pub fn $(name)($(defArgs)) -> $(ret) {
-        extern "C" {
-            fn roc__$(name)_$(Num.toStr number)_exposed_generic(ret: *mut $(ret), $(defArgs));
+    fn =
+        """
+        pub fn $(name)($(defArgs)) -> $(ret) {
+            extern "C" {
+                fn roc__$(name)_$(Num.toStr number)_exposed_generic(ret: *mut $(ret), $(defArgs));
+            }
+
+            let mut ret = core::mem::MaybeUninit::uninit();
+
+            unsafe {
+                roc__$(name)_1_exposed_generic(ret.as_mut_ptr(), $(callArgs));
+
+                ret.assume_init()
+            }
         }
+        """
+    
+    if containsConslist then
+        Str.withPrefix fn "#[allow(improper_ctypes)]"
+    else 
+        fn
 
-        let mut ret = core::mem::MaybeUninit::uninit();
-
-        unsafe {
-            roc__$(name)_1_exposed_generic(ret.as_mut_ptr(), $(callArgs));
-
-            ret.assume_init()
-        }
-    }
-    """
 
 record : Record -> Code
 record = \{ name, fields, derives } ->
@@ -1213,7 +1271,6 @@ recursiveConstructors = \{ name, variants, discriminantName, discriminantStorage
             }
 
             if variantIsNull nullability variantIndex then
-                # these could be constants, just like 
                 when discriminantStorage is
                     PointerTagging ->
                         """
@@ -2314,3 +2371,36 @@ nonRecursiveHashSnippet = \{ name, discriminant, variants, traits } ->
         |> Ok
     else
         Err NotApplicable
+
+consList : ConsList -> Code
+consList = \{ name, nonNullTag, nullTag, payload, derives } ->
+    refcounted = if Set.contains derives Copy then "false" else "true"
+
+    """
+    // no repr(C), cause the Rust repr realizes this can be turned into a nullable pointer!
+    #[derive(Debug)]
+    #[derive($(derivesList derives))]
+    pub enum $(name) {
+        $(nonNullTag)(roc_std::RocBox<$(payload)>),
+        $(nullTag),
+    }
+    
+    // lets make sure though, just in case
+    const _SIZE_CHECK_$(name): () = assert!(core::mem::size_of::<$(name)>() == core::mem::size_of::<*mut $(payload)>());
+
+    impl roc_std::RocRefcounted for $(name) {
+        fn inc(&mut self) {
+            if let StrConsList::$(nonNullTag)(boxed) = self {
+                boxed.inc();
+            }
+        }
+
+        fn dec(&mut self) {
+            if let StrConsList::$(nonNullTag)(boxed) = self {
+                boxed.dec();
+            }
+        }
+
+        fn is_refcounted() -> bool { $(refcounted) }
+    }
+    """
